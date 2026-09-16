@@ -1,0 +1,32 @@
+﻿{
+  "_aciklama": [
+    "Bayqus Proxy Rota ve Yapilandirma Sablonu.",
+    "Bu dosyayi 'routes.json' olarak kopyalayip kendi API anahtarlarinizi tanimlayabilirsiniz.",
+    "Rotalar artik model adina gore zorlanmaz; secim:",
+    "  1) Oturum Sabitlemesi (en yuksek oncelik)",
+    "  2) Proje Kurali (klasor bazli kalici kural)",
+    "  3) Varsayilan (default) Rota (kural yoksa)"
+  ],
+  "default": {
+    "name": "anthropic",
+    "upstream": "https://api.anthropic.com",
+    "auth": {
+      "header": "x-api-key",
+      "env": "ANTHROPIC_API_KEY"
+    },
+    "prune": true
+  },
+  "routes": [
+    {
+      "name": "custom-gateway",
+      "enabled": false,
+      "upstream": "https://api.your-gateway.com",
+      "auth": {
+        "header": "Authorization",
+        "prefix": "Bearer ",
+        "env": "BAYQUS_GATEWAY_KEY"
+      },
+      "prune": true
+    }
+  ]
+}

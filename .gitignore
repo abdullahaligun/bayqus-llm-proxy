@@ -1,0 +1,48 @@
+﻿# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment and virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Bayqus Proxy runtime & logs
+logs/
+*.log
+*.out
+debug_*.json
+
+# Databases & caches
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+bayqus.db
+
+# Dynamic Agent Bridge Dropzone
+bridge/pending/*
+!bridge/pending/.gitkeep
+bridge/ready/*
+!bridge/ready/.gitkeep
+
+# User-specific routing and secrets
+routes.json
+
+# Binaries
+wrapper/*.exe
+wrapper/*.dll
+
+# Node / Electron temporary
+node_modules/
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
