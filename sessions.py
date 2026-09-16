@@ -236,6 +236,7 @@ def load_claude_desktop_metadata():
     if _CLAUDE_META_CACHE and (now - _CLAUDE_META_TIME < 3):
         return dict(_CLAUDE_META_CACHE)
 
+    res = {}
     known_groups = []
     if os.path.isdir(CLAUDE_SESSIONS_DIR):
         import glob
