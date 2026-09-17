@@ -404,9 +404,12 @@ input:checked + .slider:before{transform:translateX(15px)}
             <label>Tercih Edilen Gemini Modeli (Fallback)</label>
             <select id="sum-model">
               <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Hızlı & 1M Context)</option>
-              <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+              <option value="gemini-3-flash-preview">gemini-3-flash-preview (Gemini 3 Flash)</option>
+              <option value="gemini-3.7-flash">gemini-3.7-flash (Gemini 3.7 Flash)</option>
+              <option value="gemini-3.8-flash">gemini-3.8-flash (Gemini 3.8 Flash)</option>
               <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
-              <option value="gemini-1.5-flash">gemini-1.5-flash</option>
+              <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+              <option value="gemini-flash-latest">gemini-flash-latest</option>
             </select>
           </div>
 
