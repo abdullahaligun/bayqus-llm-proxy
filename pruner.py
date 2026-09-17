@@ -78,12 +78,62 @@ def touch_session(key):
 def is_safe_boundary(messages, i):
     """
     i indeksinde kesmek guvenli mi?
-    messages[:i] bir kullanici mesajiyla (user) bitmeli ve messages[i]
-    bir asistan mesajiyla (assistant) baslamali.
+    1. i sınır dışı olamaz.
+    2. messages[i] bir tool_result olamaz (aksi takdirde onceki tool_use kopar).
+    3. messages[i-1] (veya aradaki system mesajlari haric onceki mesaj)
+       sonuclanmamis bir tool_use iceren assistant mesaji olamaz.
     """
     if i <= 0 or i >= len(messages):
         return False
-    return messages[i - 1].get("role") == "user" and messages[i].get("role") == "assistant"
+    curr = messages[i]
+    if curr.get("role") == "user":
+        c = curr.get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    return False
+    prev_idx = i - 1
+    while prev_idx >= 0 and messages[prev_idx].get("role") == "system":
+        prev_idx -= 1
+    if prev_idx >= 0:
+        prev_m = messages[prev_idx]
+        if prev_m.get("role") == "assistant":
+            c = prev_m.get("content")
+            if isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        return False
+    return True
+
+
+def ensure_alternating_roles(messages):
+    """
+    Anthropic API kurali: 'roles must alternate between user and assistant'.
+    Ayni role'e sahip ardisik mesajlari guvenli bir sekilde birlestirir.
+    """
+    if not messages:
+        return messages
+    merged = [messages[0]]
+    for m in messages[1:]:
+        prev = merged[-1]
+        p_role = prev.get("role")
+        c_role = m.get("role")
+        if p_role == c_role and p_role in ("user", "assistant"):
+            p_content = prev.get("content")
+            c_content = m.get("content")
+            blocks = []
+            if isinstance(p_content, str):
+                blocks.append({"type": "text", "text": p_content})
+            elif isinstance(p_content, list):
+                blocks.extend(p_content)
+            if isinstance(c_content, str):
+                blocks.append({"type": "text", "text": c_content})
+            elif isinstance(c_content, list):
+                blocks.extend(c_content)
+            prev["content"] = blocks
+        else:
+            merged.append(m)
+    return merged
 
 
 def extract_safe_user_boundary(messages, min_index=14, max_index=None):
@@ -161,15 +211,20 @@ def _summarize_block(block_msgs, block_index, settings):
     summary_text = None
     method = "deterministic"
 
+    # Eger blok cok buyukse (orn. binlerce mesajlik Base Block), once deterministik buda
+    msgs_to_format = block_msgs
+    if len(block_msgs) > 64:
+        msgs_to_format, _ = deterministic_prune_slice(block_msgs)
+
     if enable_ai and api_key:
-        transcript = agent_bridge.format_transcript(block_msgs)
+        transcript = agent_bridge.format_transcript(msgs_to_format)
         summary_text, status = agent_bridge.call_gemini_summary(transcript, api_key, pref_model, block_index=block_index)
         if summary_text:
             method = f"gemini_flash ({status})"
 
     if not summary_text:
         pruned, _ = deterministic_prune_slice(block_msgs)
-        summary_text = agent_bridge.format_transcript(pruned)[:1200]
+        summary_text = agent_bridge.format_transcript(pruned)[:2000]
         method = "deterministic"
 
     return [
@@ -208,8 +263,14 @@ def build_archive_chain(msgs, session_key, block_size, settings, cold=False):
     cold_buffer = 0 if cold else COLD_BUFFER
     safe_max_archive = len(msgs) - effective_keep - cold_buffer
 
-    while safe_max_archive >= block_size:
-        target = (next_index + 1) * block_size
+    while (safe_max_archive - prev_boundary) >= block_size:
+        # Eger ilk blok (next_index == 0) devasa bir gecmisten basliyorsa (> 2 * block_size),
+        # 150 ayri cagri yapmak yerine tek seferde guvenli en buyuk siniri Base Block (0) olarak alir.
+        if next_index == 0 and safe_max_archive > 2 * block_size:
+            target = safe_max_archive
+        else:
+            target = prev_boundary + block_size
+
         if target > safe_max_archive:
             break
 
@@ -560,7 +621,7 @@ def plan(payload, session_id=None):
     archive_result_anchored = anchor_prefix_cache_control(archive_result)
 
     # 5. Final payload olustur
-    final_messages = archive_result_anchored + cold_pruned + hot_msgs
+    final_messages = ensure_alternating_roles(archive_result_anchored + cold_pruned + hot_msgs)
     new_payload = dict(payload)
     new_payload["messages"] = final_messages
     normalize_cache_controls(new_payload)
