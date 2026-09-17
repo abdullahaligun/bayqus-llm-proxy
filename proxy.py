@@ -30,6 +30,7 @@ import http.server
 import socketserver
 import urllib.request
 import urllib.error
+import urllib.parse
 import ssl
 import json
 import os
@@ -195,11 +196,18 @@ def estimate_tokens(parsed):
 
 
 class UsageScanner:
-    """SSE akisindan usage alanlarini ayiklar; akisi degistirmez."""
+    """SSE akisindan hem usage alanlarini hem de modelin urettigi yanit icerigini
+    (metin, tool_use bloklari, thinking, hata) ayiklar; akisi geciktirmez."""
 
     def __init__(self):
         self.buf = ""
         self.usage = {}
+        self.blocks = {}          # index -> content_block dict
+        self.tool_inputs = {}      # index -> str (biriken json)
+        self.openai_text = []
+        self.openai_tool_calls = {}
+        self.stop_reason = None
+        self.stream_errors = []
 
     def feed(self, chunk_text):
         self.buf += chunk_text
@@ -215,12 +223,107 @@ class UsageScanner:
                 o = json.loads(payload)
             except Exception:
                 continue
+
+            # Usage yakalama
             u = (o.get("message") or {}).get("usage") or o.get("usage")
             if isinstance(u, dict):
                 for k, v in u.items():
                     if isinstance(v, int):
                         # message_delta output_tokens kumulatiftir -> son deger kazanir
                         self.usage[k] = v
+
+            ev_type = o.get("type")
+
+            # Anthropic SSE
+            if ev_type == "content_block_start":
+                idx = o.get("index", 0)
+                cb = o.get("content_block") or {}
+                self.blocks[idx] = dict(cb)
+                if cb.get("type") == "tool_use":
+                    self.tool_inputs[idx] = ""
+            elif ev_type == "content_block_delta":
+                idx = o.get("index", 0)
+                delta = o.get("delta") or {}
+                dtype = delta.get("type")
+                if dtype == "text_delta":
+                    txt = delta.get("text", "")
+                    if idx not in self.blocks:
+                        self.blocks[idx] = {"type": "text", "text": ""}
+                    self.blocks[idx]["text"] = self.blocks[idx].get("text", "") + txt
+                elif dtype == "input_json_delta":
+                    pj = delta.get("partial_json", "")
+                    self.tool_inputs[idx] = self.tool_inputs.get(idx, "") + pj
+                elif dtype == "thinking_delta":
+                    th = delta.get("thinking", "")
+                    if idx not in self.blocks:
+                        self.blocks[idx] = {"type": "thinking", "thinking": ""}
+                    self.blocks[idx]["thinking"] = self.blocks[idx].get("thinking", "") + th
+            elif ev_type == "content_block_stop":
+                idx = o.get("index", 0)
+                if idx in self.tool_inputs and idx in self.blocks:
+                    raw_in = self.tool_inputs[idx]
+                    try:
+                        self.blocks[idx]["input"] = json.loads(raw_in) if raw_in else {}
+                    except Exception:
+                        self.blocks[idx]["input"] = raw_in
+            elif ev_type == "message_delta":
+                delta = o.get("delta") or {}
+                if "stop_reason" in delta:
+                    self.stop_reason = delta.get("stop_reason")
+            elif ev_type == "error":
+                self.stream_errors.append(o.get("error") or o)
+
+            # OpenAI SSE fallback
+            choices = o.get("choices")
+            if isinstance(choices, list) and choices:
+                c0 = choices[0]
+                delta = c0.get("delta") or {}
+                c_txt = delta.get("content")
+                if c_txt:
+                    self.openai_text.append(c_txt)
+                tc = delta.get("tool_calls")
+                if isinstance(tc, list):
+                    for call in tc:
+                        c_idx = call.get("index", 0)
+                        if c_idx not in self.openai_tool_calls:
+                            self.openai_tool_calls[c_idx] = {
+                                "id": call.get("id", ""),
+                                "name": (call.get("function") or {}).get("name", ""),
+                                "args": ""
+                            }
+                        f = call.get("function") or {}
+                        if "name" in f and f["name"]:
+                            self.openai_tool_calls[c_idx]["name"] = f["name"]
+                        if "arguments" in f:
+                            self.openai_tool_calls[c_idx]["args"] += f["arguments"]
+
+    def get_content(self):
+        """Toplanan bloklari standart content listesi olarak doner."""
+        if self.stream_errors:
+            return [{"type": "error", "error": err} for err in self.stream_errors]
+        if self.blocks:
+            for idx, raw_in in self.tool_inputs.items():
+                if idx in self.blocks and "input" not in self.blocks[idx]:
+                    try:
+                        self.blocks[idx]["input"] = json.loads(raw_in) if raw_in else {}
+                    except Exception:
+                        self.blocks[idx]["input"] = raw_in
+            return [self.blocks[k] for k in sorted(self.blocks.keys())]
+        if self.openai_tool_calls:
+            calls = []
+            for k in sorted(self.openai_tool_calls.keys()):
+                item = self.openai_tool_calls[k]
+                try:
+                    inp = json.loads(item["args"])
+                except Exception:
+                    inp = item["args"]
+                calls.append({"type": "tool_use", "id": item["id"], "name": item["name"], "input": inp})
+            if self.openai_text:
+                return [{"type": "text", "text": "".join(self.openai_text)}] + calls
+            return calls
+        if self.openai_text:
+            return [{"type": "text", "text": "".join(self.openai_text)}]
+        return []
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -305,6 +408,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     payload["oturum_hatasi"] = f"{type(e).__name__}: {e}"
                 self._serve(json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                             "application/json; charset=utf-8")
+            elif self.path.startswith("/__bayqus/history"):
+                parsed_url = urllib.parse.urlparse(self.path)
+                qs = urllib.parse.parse_qs(parsed_url.query)
+                req_id = qs.get("id", [None])[0]
+                if req_id:
+                    try:
+                        detail = db.get_request_detail(int(req_id))
+                        if detail:
+                            self._serve(json.dumps(detail, ensure_ascii=False).encode("utf-8"),
+                                        "application/json; charset=utf-8")
+                        else:
+                            self._fail(404, "kayit bulunamadi")
+                    except Exception as e_det:
+                        self._fail(400, f"gecersiz id: {e_det}")
+                    return
+                limit = int(qs.get("limit", ["50"])[0])
+                offset = int(qs.get("offset", ["0"])[0])
+                session_id = qs.get("session", [None])[0]
+                search = qs.get("q", [None])[0]
+                hist = db.get_history(limit=limit, offset=offset, session_id=session_id, search=search)
+                self._serve(json.dumps(hist, ensure_ascii=False).encode("utf-8"),
+                            "application/json; charset=utf-8")
+                return
             else:
                 self._serve(dashboard.PAGE.encode("utf-8"),
                             "text/html; charset=utf-8")
@@ -521,6 +647,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve(json.dumps({"ok": True, "mesaj": "Prefix önbelleği temizlendi!"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             return
 
+        # İstek geçmişi temizleme
+        if self.path.startswith("/__bayqus/history/clear"):
+            db.clear_history()
+            print(f"[pano] istek gecmisi temizlendi")
+            self._serve(json.dumps({"ok": True, "mesaj": "İstek geçmişi temizlendi!"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
         # Gemini API testi
         if self.path.startswith("/__bayqus/summarizer/test-gemini"):
             api_key = req.get("api_key", "").strip() or db.get_setting("ai_studio_api_key", "")
@@ -674,7 +807,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sent_bytes = len(body) if body else 0
         req_info["route"] = route["name"]
         req_info["upstream"] = upstream
+        req_info["method"] = method
+        req_info["path"] = self.path
         self._print_plan(plan, orig_bytes, planned_bytes)
+
+        sent_parsed = None
+        if body:
+            try:
+                sent_parsed = json.loads(body.decode("utf-8"))
+            except Exception:
+                sent_parsed = parsed
+        else:
+            sent_parsed = parsed
 
         incoming = {k: v for k, v in self.headers.items()
                     if k.lower() not in HOP_BY_HOP}
@@ -767,6 +911,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.flush()
                     usage = scanner.usage
                     resp_bytes = total
+                    resp_content = scanner.get_content()
                 else:
                     data = r.read()
                     self.send_header("Content-Length", str(len(data)))
@@ -774,15 +919,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(data)
                     resp_bytes = len(data)
                     usage = {}
+                    resp_content = None
                     try:
                         o = json.loads(data)
                         usage = (o.get("message") or {}).get("usage") or o.get("usage") or {}
+                        resp_content = (o.get("message") or {}).get("content") or o.get("content")
                     except Exception:
-                        pass
+                        resp_content = [{"type": "raw", "data": data[:2000].decode("utf-8", "replace")}]
 
                 ms = int((time.time() - t0) * 1000)
                 self._report(r.status, ms, req_info, usage, resp_bytes,
-                             plan, orig_bytes, planned_bytes, sent_bytes)
+                             plan, orig_bytes, planned_bytes, sent_bytes,
+                             sent_parsed=sent_parsed, resp_content=resp_content)
 
         except urllib.error.HTTPError as e:
             if e.code == 404 and "count_tokens" in self.path:
@@ -791,7 +939,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ms = int((time.time() - t0) * 1000)
                 print(f"[{ts}] <-- 200 ({ms}ms)  yerel count_tokens fallback: {token_count} token (upstream 404 onlendi)")
                 self._report(200, ms, req_info, {"input_tokens": token_count}, len(resp_data),
-                             plan, orig_bytes, planned_bytes, sent_bytes, phase="fallback:count_tokens")
+                             plan, orig_bytes, planned_bytes, sent_bytes, phase="fallback:count_tokens",
+                             sent_parsed=sent_parsed, resp_content={"input_tokens": token_count})
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(resp_data)))
@@ -806,8 +955,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if MODE == "prune" and plan and plan.get("applied"):
                 print("           ^ budama ACIKTI — hata budamadan olabilir. "
                       "BAYQUS_MODE=shadow ile dogrulayin.")
+            err_content = [{"type": "error", "code": e.code, "message": err_msg}]
             self._report(e.code, ms, req_info, {}, len(data),
-                         plan, orig_bytes, planned_bytes, sent_bytes, error=err_msg)
+                         plan, orig_bytes, planned_bytes, sent_bytes, error=err_msg,
+                         sent_parsed=sent_parsed, resp_content=err_content)
             self.send_response(e.code)
             self.send_header("Content-Type", e.headers.get("Content-Type", "application/json"))
             self.send_header("Content-Length", str(len(data)))
@@ -817,15 +968,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ms = int((time.time() - t0) * 1000)
             err_msg = f"{type(e).__name__}: {e}"
             print(f"[{ts}] !!! {err_msg}")
+            err_content = [{"type": "exception", "error": err_msg}]
             self._report(502, ms, req_info, {}, 0,
-                         plan, orig_bytes, planned_bytes, sent_bytes, error=err_msg)
+                         plan, orig_bytes, planned_bytes, sent_bytes, error=err_msg,
+                         sent_parsed=sent_parsed, resp_content=err_content)
             try:
                 self.send_error(502, str(e))
             except Exception:
                 pass
 
     def _report(self, status, ms, req_info, usage, resp_bytes,
-                plan, orig_bytes, planned_bytes, sent_bytes, phase=None, error=None):
+                plan, orig_bytes, planned_bytes, sent_bytes, phase=None, error=None,
+                sent_parsed=None, resp_content=None):
         inp = usage.get("input_tokens", 0)
         cr = usage.get("cache_read_input_tokens", 0)
         cc = usage.get("cache_creation_input_tokens", 0)
@@ -867,6 +1021,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
             }
         with open(METRICS, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        # Son 5000 istek icerigi kaydi (SQLite halka tamponu)
+        try:
+            sys_val = sent_parsed.get("system") if isinstance(sent_parsed, dict) else None
+            msgs_val = sent_parsed.get("messages") if isinstance(sent_parsed, dict) else None
+            prune_applied = bool(plan and plan.get("applied"))
+            p_info = None
+            if prune_applied:
+                p_info = {
+                    "cutoff": plan.get("cutoff"),
+                    "total_messages": plan.get("total_messages"),
+                    "stats": plan.get("stats"),
+                    "reason": plan.get("reason"),
+                }
+            db.record_request(
+                session_id=req_info.get("session") or "",
+                agent_id=req_info.get("agent") or "",
+                method=req_info.get("method") or "POST",
+                path=req_info.get("path") or self.path,
+                status_code=status,
+                duration_ms=ms,
+                model=req_info.get("model"),
+                model_sent=req_info.get("model_sent") or req_info.get("model"),
+                route=req_info.get("route"),
+                upstream=req_info.get("upstream"),
+                system_prompt=sys_val,
+                messages=msgs_val,
+                response_content=resp_content,
+                usage=usage,
+                prune_applied=prune_applied,
+                prune_info=p_info
+            )
+        except Exception as e_rec:
+            print(f"[!] İstek geçmişi kaydedilirken hata: {e_rec}")
 
 
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):

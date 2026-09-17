@@ -186,6 +186,7 @@ input:checked + .slider:before{transform:translateX(15px)}
 <nav class="tabs">
   <button class="tab-btn active" data-tab="tab-sessions">💬 Oturumlar & Proje Yönlendirmesi</button>
   <button class="tab-btn" data-tab="tab-traffic">🚦 Trafik & Sniffer Log</button>
+  <button class="tab-btn" data-tab="tab-history" onclick="loadHistory()">📜 İstek Geçmişi & Mesajlar (Son 5000)</button>
   <button class="tab-btn" data-tab="tab-analytics">📊 Analiz & Metrikler</button>
   <button class="tab-btn" data-tab="tab-routes">⚙️ Rota Tanımları</button>
   <button class="tab-btn" data-tab="tab-summarizer">🧠 Akıllı Özetleyici & Prefix Cache</button>
@@ -442,6 +443,51 @@ input:checked + .slider:before{transform:translateX(15px)}
     <!-- Antigravity Ajan Kuyruğu Tablosu -->
     <h2>Antigravity Ajan Kuyruğu (Bekleyen Özet İstekleri)</h2>
     <div id="pending-summaries-wrap"></div>
+  <!-- TAB: İSTEK GEÇMİŞİ & MESAJ İÇERİKLERİ (SON 5000) -->
+  <section id="tab-history" class="tab-content">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+      <div style="display:flex;align-items:center;gap:10px;flex:1;max-width:650px">
+        <input type="text" id="hist-search" placeholder="Mesaj içeriğinde, yanıtta veya sistem yönergesinde ara..." style="flex:1" onkeydown="if(event.key==='Enter')loadHistory(0)">
+        <button class="primary" onclick="loadHistory(0)">🔍 Ara</button>
+        <button onclick="document.getElementById('hist-search').value='';loadHistory(0)">Temizle</button>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="hist-total-badge" class="badge badge-dim">Toplam: 0</span>
+        <button onclick="loadHistory(CURRENT_HIST_OFFSET)">🔄 Yenile</button>
+        <button class="danger" onclick="clearAllHistory()">🗑️ Geçmişi Sıfırla</button>
+      </div>
+    </div>
+
+    <div class="wrap">
+      <table id="hist-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Zaman</th>
+            <th>Durum</th>
+            <th>Süre</th>
+            <th style="text-align:left">Model</th>
+            <th>Girdi</th>
+            <th>Çıktı</th>
+            <th>Önbellek</th>
+            <th>Boyut</th>
+            <th>Oturum</th>
+            <th>İşlem</th>
+          </tr>
+        </thead>
+        <tbody id="hist-tbody">
+          <tr><td colspan="11" class="empty">İstek geçmişi yükleniyor...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px">
+      <div id="hist-page-info" class="dim mono" style="font-size:12px"></div>
+      <div class="btn-group">
+        <button id="hist-prev-btn" onclick="prevHistoryPage()" disabled>⬅️ Önceki</button>
+        <button id="hist-next-btn" onclick="nextHistoryPage()" disabled>Sonraki ➡️</button>
+      </div>
+    </div>
   </section>
 
 </main>
@@ -454,6 +500,17 @@ input:checked + .slider:before{transform:translateX(15px)}
       <button class="close-btn" onclick="closeModal('inspector-modal')">&times;</button>
     </div>
     <div id="insp-content"></div>
+  </div>
+</div>
+
+<!-- MODAL: GEÇMİŞ İSTEK VE YANIT DETAYI -->
+<div class="modal-overlay" id="history-modal" onclick="if(event.target===this)closeModal('history-modal')">
+  <div class="modal" style="max-width:950px;max-height:90vh;display:flex;flex-direction:column">
+    <div class="modal-header">
+      <h3 class="modal-title" id="hist-modal-title">İstek ve Yanıt İçeriği</h3>
+      <button class="close-btn" onclick="closeModal('history-modal')">&times;</button>
+    </div>
+    <div id="hist-modal-body" style="overflow-y:auto;flex:1;padding-right:8px"></div>
   </div>
 </div>
 
@@ -1644,6 +1701,220 @@ async function promptSubmitAgentSummary(prefixHash){
     alert(j.mesaj || 'Özet kaydedildi!');
     tick(true);
   }catch(err){ alert('Hata: ' + err.message); }
+}
+
+// === İSTEK GEÇMİŞİ & MESAJ İÇERİKLERİ (SON 5000) ===
+let CURRENT_HIST_OFFSET = 0;
+const HIST_PAGE_SIZE = 30;
+
+async function loadHistory(offset = 0) {
+  CURRENT_HIST_OFFSET = offset;
+  const tbody = document.getElementById('hist-tbody');
+  tbody.innerHTML = '<tr><td colspan="11" class="empty">İstek geçmişi yükleniyor...</td></tr>';
+  const q = encodeURIComponent(document.getElementById('hist-search')?.value || '');
+  try {
+    const url = `/__bayqus/history?limit=${HIST_PAGE_SIZE}&offset=${offset}` + (q ? `&q=${q}` : '');
+    const res = await fetch(url, {cache: 'no-store'});
+    const data = await res.json();
+    const total = data.total || 0;
+    const items = data.items || [];
+
+    document.getElementById('hist-total-badge').textContent = `Toplam: ${N(total)}`;
+    document.getElementById('hist-page-info').textContent = total === 0 ? 'Kayıt yok' :
+      `${offset + 1} - ${Math.min(offset + items.length, total)} / ${N(total)} gösteriliyor`;
+    document.getElementById('hist-prev-btn').disabled = offset <= 0;
+    document.getElementById('hist-next-btn').disabled = offset + items.length >= total;
+
+    if (items.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="11" class="empty">Kayıtlı istek bulunamadı.</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = items.map(it => {
+      const u = it.usage || {};
+      const inp = u.input_tokens || 0;
+      const out = u.output_tokens || 0;
+      const cr = u.cache_read_input_tokens || 0;
+      const ts = (it.ts || '').slice(0, 19).replace('T', ' ');
+      const dur = `${it.duration_ms}ms`;
+      const pruneBadge = it.prune_applied ? ' <span class="badge badge-warn" title="Delta Budama Uygulandı">Budandı</span>' : '';
+      const statusBadge = it.status_code === 200 ?
+        '<span class="badge badge-ok">200 OK</span>' :
+        `<span class="badge badge-bad">${it.status_code}</span>`;
+      const sid = (it.session_id || '').slice(0, 10);
+      const reqB = (it.req_bytes || 0) > 1024 ? `${Math.round(it.req_bytes / 1024)} KB` : `${it.req_bytes || 0} B`;
+
+      return `
+        <tr class="clickable" onclick="openHistoryDetail(${it.id})">
+          <td class="mono"><strong>#${it.id}</strong></td>
+          <td class="mono" style="font-size:11px">${esc(ts)}</td>
+          <td>${statusBadge}</td>
+          <td class="mono">${esc(dur)}</td>
+          <td style="text-align:left"><span class="badge badge-dim mono">${esc(it.model || '-')}</span>${pruneBadge}</td>
+          <td class="mono">${N(inp)}</td>
+          <td class="mono">${N(out)}</td>
+          <td class="mono ${cr > 0 ? 'ok' : 'dim'}">${cr > 0 ? N(cr) : '-'}</td>
+          <td class="mono dim">${esc(reqB)}</td>
+          <td class="mono dim" title="${esc(it.session_id)}">${esc(sid || '-')}</td>
+          <td><button class="sm primary" onclick="event.stopPropagation();openHistoryDetail(${it.id})">🔍 İncele</button></td>
+        </tr>
+      `;
+    }).join('');
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="11" class="empty bad">Yükleme hatası: ${esc(err.message)}</td></tr>`;
+  }
+}
+
+function prevHistoryPage() {
+  if (CURRENT_HIST_OFFSET >= HIST_PAGE_SIZE) {
+    loadHistory(CURRENT_HIST_OFFSET - HIST_PAGE_SIZE);
+  }
+}
+
+function nextHistoryPage() {
+  loadHistory(CURRENT_HIST_OFFSET + HIST_PAGE_SIZE);
+}
+
+async function openHistoryDetail(id) {
+  openModal('history-modal');
+  const body = document.getElementById('hist-modal-body');
+  document.getElementById('hist-modal-title').textContent = `İstek & Yanıt Detayı (#${id})`;
+  body.innerHTML = '<div class="empty">Yükleniyor...</div>';
+  try {
+    const res = await fetch(`/__bayqus/history?id=${id}`);
+    const req = await res.json();
+    if (!req || req.error) {
+      body.innerHTML = `<div class="empty bad">İstek bulunamadı: ${esc(req?.error || '')}</div>`;
+      return;
+    }
+
+    const u = req.usage || {};
+    let html = `
+      <div class="grid" style="margin-bottom:14px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr))">
+        <div class="card"><div class="k">ZAMAN</div><div class="v" style="font-size:13px">${esc(req.ts?.slice(0,19).replace('T',' '))}</div></div>
+        <div class="card"><div class="k">MODEL</div><div class="v" style="font-size:13px">${esc(req.model || '-')}</div></div>
+        <div class="card"><div class="k">DURUM / SÜRE</div><div class="v" style="font-size:13px">${req.status_code} (${req.duration_ms}ms)</div></div>
+        <div class="card"><div class="k">GİRDİ / ÇIKTI</div><div class="v" style="font-size:13px">${N(u.input_tokens||0)} / ${N(u.output_tokens||0)}</div></div>
+        <div class="card"><div class="k">CACHE OKU / YAZ</div><div class="v" style="font-size:13px">${N(u.cache_read_input_tokens||0)} / ${N(u.cache_creation_input_tokens||0)}</div></div>
+      </div>
+    `;
+
+    if (req.prune_applied) {
+      const p = req.prune_info || {};
+      html += `
+        <div style="background:var(--warn-bg);border:1px solid var(--warn);padding:8px 12px;border-radius:6px;margin-bottom:12px;font-size:12px">
+          <strong>⚡ Budama Uygulandı:</strong> Kesim Sınırı: ${p.cutoff || '-'}, Sebep: ${p.reason || 'delta_ledger'}
+        </div>
+      `;
+    }
+
+    if (req.system_prompt) {
+      html += `
+        <h3 style="font-size:13px;margin:12px 0 6px">📋 Sistem Yönergesi (${N(req.system_prompt.length)} karakter)</h3>
+        <pre style="background:var(--bg);padding:10px;border-radius:6px;max-height:180px;overflow-y:auto;white-space:pre-wrap;font-size:11.5px;border:1px solid var(--line)">${esc(req.system_prompt)}</pre>
+      `;
+    }
+
+    const msgs = req.messages;
+    html += `<h3 style="font-size:13px;margin:16px 0 6px">💬 Giden Mesajlar (${Array.isArray(msgs) ? msgs.length : 0} Adet)</h3>`;
+    if (Array.isArray(msgs)) {
+      html += msgs.map((m, idx) => {
+        const role = (m.role || 'unknown').toUpperCase();
+        const roleBadge = role === 'USER' ? 'badge-blue' : (role === 'ASSISTANT' ? 'badge-purple' : 'badge-dim');
+        let contentHtml = '';
+        if (typeof m.content === 'string') {
+          contentHtml = `<pre style="white-space:pre-wrap;margin:4px 0 0;font-size:12px">${esc(m.content)}</pre>`;
+        } else if (Array.isArray(m.content)) {
+          contentHtml = m.content.map((b, bIdx) => {
+            if (b.type === 'text') {
+              return `<div style="margin:3px 0"><span class="badge badge-dim">text</span> <pre style="white-space:pre-wrap;margin:2px 0 0;font-size:12px">${esc(b.text||'')}</pre></div>`;
+            } else if (b.type === 'tool_use') {
+              return `<div style="margin:4px 0;background:rgba(217,119,6,0.06);padding:6px;border-radius:4px;border:1px solid rgba(217,119,6,0.2)">
+                <span class="badge badge-warn">tool_use: ${esc(b.name)}</span> (id: ${esc(b.id||'')})
+                <pre style="white-space:pre-wrap;margin:2px 0 0;font-size:11.5px">${esc(JSON.stringify(b.input||{}, null, 2))}</pre>
+              </div>`;
+            } else if (b.type === 'tool_result') {
+              const resText = typeof b.content === 'string' ? b.content : JSON.stringify(b.content, null, 2);
+              return `<div style="margin:4px 0;background:rgba(22,163,74,0.06);padding:6px;border-radius:4px;border:1px solid rgba(22,163,74,0.2)">
+                <span class="badge badge-ok">tool_result</span> (id: ${esc(b.tool_use_id||'')})
+                <pre style="white-space:pre-wrap;margin:2px 0 0;font-size:11.5px;max-height:220px;overflow-y:auto">${esc(resText||'')}</pre>
+              </div>`;
+            }
+            return `<pre style="font-size:11px">${esc(JSON.stringify(b))}</pre>`;
+          }).join('');
+        }
+        return `
+          <div style="background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:10px;margin-bottom:8px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+              <span class="badge ${roleBadge}">#${idx+1} ${role}</span>
+            </div>
+            ${contentHtml}
+          </div>
+        `;
+      }).join('');
+    }
+
+    const resp = req.response;
+    html += `<h3 style="font-size:13px;margin:16px 0 6px">🤖 Gelen Model Yanıtı</h3>`;
+    if (Array.isArray(resp)) {
+      html += resp.map((b, bIdx) => {
+        if (b.type === 'text') {
+          return `
+            <div style="background:var(--ok-bg);border:1px solid var(--ok);border-radius:6px;padding:10px;margin-bottom:8px">
+              <span class="badge badge-ok">text</span>
+              <pre style="white-space:pre-wrap;margin:4px 0 0;font-size:12.5px">${esc(b.text || '')}</pre>
+            </div>
+          `;
+        } else if (b.type === 'tool_use') {
+          return `
+            <div style="background:var(--warn-bg);border:1px solid var(--warn);border-radius:6px;padding:10px;margin-bottom:8px">
+              <span class="badge badge-warn">tool_use: ${esc(b.name)}</span> (id: ${esc(b.id||'')})
+              <pre style="white-space:pre-wrap;margin:4px 0 0;font-size:12px">${esc(JSON.stringify(b.input || {}, null, 2))}</pre>
+            </div>
+          `;
+        } else if (b.type === 'thinking') {
+          return `
+            <div style="background:var(--purple-bg);border:1px solid var(--purple);border-radius:6px;padding:10px;margin-bottom:8px">
+              <span class="badge badge-purple">thinking</span>
+              <pre style="white-space:pre-wrap;margin:4px 0 0;font-size:11.5px;max-height:180px;overflow-y:auto">${esc(b.thinking || '')}</pre>
+            </div>
+          `;
+        } else if (b.type === 'error') {
+          return `
+            <div style="background:var(--bad-bg);border:1px solid var(--bad);border-radius:6px;padding:10px;margin-bottom:8px">
+              <span class="badge badge-bad">Hata</span>
+              <pre style="white-space:pre-wrap;margin:4px 0 0;font-size:12px">${esc(JSON.stringify(b, null, 2))}</pre>
+            </div>
+          `;
+        }
+        return `<pre style="background:var(--bg);padding:8px;border-radius:6px;font-size:11.5px">${esc(JSON.stringify(b, null, 2))}</pre>`;
+      }).join('');
+    } else if (resp) {
+      html += `<pre style="background:var(--ok-bg);padding:10px;border-radius:6px;font-size:12px">${esc(typeof resp === 'string' ? resp : JSON.stringify(resp, null, 2))}</pre>`;
+    } else {
+      html += `<div class="empty">Yanıt içeriği boş</div>`;
+    }
+
+    body.innerHTML = html;
+  } catch (err) {
+    body.innerHTML = `<div class="empty bad">Detay yüklenemedi: ${esc(err.message)}</div>`;
+  }
+}
+
+async function clearAllHistory() {
+  if (!confirm('Son kaydedilen istek geçmişinin tümü silinecek. Emin misiniz?')) return;
+  try {
+    const res = await fetch('/__bayqus/history/clear', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({})
+    });
+    const j = await res.json();
+    alert(j.mesaj || 'Temizlendi');
+    loadHistory(0);
+  } catch (err) {
+    alert('Hata: ' + err.message);
+  }
 }
 
 // Live polling
