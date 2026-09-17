@@ -25,10 +25,10 @@ import time
 import agent_bridge
 import db
 
-BLOCK = int(os.environ.get("BAYQUS_BLOCK", "48"))
+BLOCK = int(os.environ.get("BAYQUS_BLOCK", "32"))
 KEEP_RECENT = int(os.environ.get("BAYQUS_KEEP_RECENT", "40"))
-COLD_BUFFER = int(os.environ.get("BAYQUS_COLD_BUFFER", "16"))
-KEEP_RECENT_COLD = int(os.environ.get("BAYQUS_KEEP_RECENT_COLD", "14"))
+COLD_BUFFER = int(os.environ.get("BAYQUS_COLD_BUFFER", "12"))
+KEEP_RECENT_COLD = int(os.environ.get("BAYQUS_KEEP_RECENT_COLD", "12"))
 TTL = int(os.environ.get("BAYQUS_TTL", "300"))
 MIN_MESSAGES = int(os.environ.get("BAYQUS_MIN_MESSAGES", "12"))
 
@@ -125,6 +125,121 @@ def find_cutoff(messages, keep_recent, block_size=16):
         if is_safe_boundary(messages, i):
             return i
     return 0
+
+
+def _clean_for_hash(messages):
+    """cache_control gurultusunden temizlenmis kopya (hash icin)."""
+    clean = copy.deepcopy(messages)
+    for m in clean:
+        c = m.get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict):
+                    b.pop("cache_control", None)
+        m.pop("cache_control", None)
+    return clean
+
+
+def _block_hash(block_msgs):
+    raw = json.dumps(_clean_for_hash(block_msgs), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _find_block_boundary(msgs, target, prev_boundary):
+    """target'a en yakin GUVENLI sinir. prev_boundary'den once olamaz."""
+    for i in range(min(target, len(msgs) - 1), prev_boundary, -1):
+        if is_safe_boundary(msgs, i):
+            return i
+    return None  # bu turda henuz guvenli blok siniri bulunamadi
+
+
+def _summarize_block(block_msgs, block_index, settings):
+    """SADECE bu blogu ozetler (tum gecmisi degil). ~150-250 kelime."""
+    enable_ai = settings.get("enable_ai_summarizer", "true") == "true"
+    api_key = settings.get("ai_studio_api_key", "")
+    pref_model = settings.get("preferred_gemini_model", "gemini-3.1-flash-lite")
+    summary_text = None
+    method = "deterministic"
+
+    if enable_ai and api_key:
+        transcript = agent_bridge.format_transcript(block_msgs)
+        summary_text, status = agent_bridge.call_gemini_summary(transcript, api_key, pref_model, block_index=block_index)
+        if summary_text:
+            method = f"gemini_flash ({status})"
+
+    if not summary_text:
+        pruned, _ = deterministic_prune_slice(block_msgs)
+        summary_text = agent_bridge.format_transcript(pruned)[:1200]
+        method = "deterministic"
+
+    return [
+        {"role": "user",
+         "content": f"[{block_index + 1}. Aşama Özeti]:\n\n{summary_text}"},
+        {"role": "assistant",
+         "content": f"{block_index + 1}. aşama hafızamda. Kaldığımız yerden devam ediyorum."},
+    ], method
+
+
+def build_archive_chain(msgs, session_key, block_size, settings, cold=False):
+    """
+    Finalize edilmis bloklari ledger'dan okur, eksik olan(lar)i tamamlar,
+    her biri icin (varsa) SQLite delta cache'ine bakar, yoksa Gemini/Agent
+    cagirip TEK SEFERLIK ozetler. Onceki bloklara ASLA dokunmaz.
+    Doner: (archive_result_messages, son_finalize_edilen_sinir, methods_used)
+    """
+    ledger = db.get_session_blocks(session_key)
+    archive_result = []
+    prev_boundary = 0
+    next_index = 0
+    methods_used = []
+
+    # 1. Zaten finalize edilmis bloklari aynen ekle (SQLite ledger'dan, deterministik)
+    for row in ledger:
+        cached = db.get_cached_prefix(row["block_hash"])
+        if cached:
+            archive_result.extend(cached["messages"])
+            methods_used.append(cached.get("summary_method") or "ledger_cache")
+        prev_boundary = row["right_boundary"]
+        next_index = row["block_index"] + 1
+
+    # 2. Yeni tamamlanmis blok var mi kontrol et (append-only: sadece SONA ekle)
+    keep_recent_cfg = int(settings.get("keep_recent_messages", KEEP_RECENT))
+    effective_keep = KEEP_RECENT_COLD if cold else keep_recent_cfg
+    cold_buffer = 0 if cold else COLD_BUFFER
+    safe_max_archive = len(msgs) - effective_keep - cold_buffer
+
+    while safe_max_archive >= block_size:
+        target = (next_index + 1) * block_size
+        if target > safe_max_archive:
+            break
+
+        boundary = _find_block_boundary(msgs, target, prev_boundary)
+        if boundary is None or boundary <= prev_boundary:
+            break  # bu blok henuz guvenli bir sekilde tamamlanmadi, bekle
+
+        block_msgs = msgs[prev_boundary:boundary]
+        bhash = _block_hash(block_msgs)
+        cached = db.get_cached_prefix(bhash)
+
+        if cached:
+            delta_pair = cached["messages"]
+            methods_used.append(cached.get("summary_method") or "cached")
+        else:
+            delta_pair, method = _summarize_block(block_msgs, next_index, settings)
+            pruned_json_len = len(json.dumps(delta_pair, ensure_ascii=False))
+            orig_len = len(json.dumps(block_msgs, ensure_ascii=False))
+            db.save_cached_prefix(bhash, delta_pair,
+                                   max(0, (orig_len - pruned_json_len) // 4),
+                                   max(0, orig_len - pruned_json_len),
+                                   method)
+            methods_used.append(method)
+
+        db.finalize_session_block(session_key, next_index, boundary, bhash)
+        archive_result.extend(delta_pair)
+        prev_boundary = boundary
+        next_index += 1
+
+    return archive_result, prev_boundary, methods_used
 
 
 # --------------------------------------------------------------------------
@@ -386,12 +501,13 @@ def normalize_cache_controls(obj):
 # --------------------------------------------------------------------------
 def plan(payload, session_id=None):
     """
-    Uc katmanli budama plani olusturur (Hot/Cold/Archive).
+    Immutable Append-Only Delta Ledger budama plani (Hot/Cold/Archive).
 
-    Arsiv  (0..archive_cut)       : Gemini ozeti ile 2 mesaja indirilir.
-                                    BLOCK=48 ile yuvarlenir, cok seyrek degisir.
+    Arsiv  (0..archive_cut)       : SQLite Session Ledger tarafindan kilitlenmis,
+                                    her blok (32 adim) kendi (user, assistant) ciftinde
+                                    donmus ve asla degismeyen delta ozetler zinciri.
     Soguk  (archive_cut..hot_cut) : deterministic_prune_slice ile kirpilir.
-                                    Tampon gorevi gorur, arsiv hash'ini korur.
+                                    Tampon gorevi gorur, arsiv zincirini korur.
     Sicak  (hot_cut..son)         : Hic dokunulmaz, tam metin.
 
     payload'i DEGISTIRMEZ.
@@ -410,151 +526,65 @@ def plan(payload, session_id=None):
     st, since = touch_session(key)
     cold = since is None or since >= TTL
 
-    # --- Uc katmanli sinir hesaplama ---
-    if cold:
-        # Soguk baslangic: arsiv + soguk birlestir, sadece KEEP_RECENT_COLD tut
-        effective_keep = min(keep_recent_cfg, KEEP_RECENT_COLD)
-        raw_archive = max(0, n - effective_keep)
-        archive_cut = 0
-        for i in range(min(raw_archive, n - 1), 0, -1):
-            if is_safe_boundary(msgs, i):
-                archive_cut = i
-                break
-        hot_cut = archive_cut  # soguk katman yok, arsiv dogrudan sicaga gecis
-    else:
-        # Normal (sicak) akis: uc katmanli
-        hot_cut_raw = n - keep_recent_cfg
-        archive_raw = max(0, hot_cut_raw - cold_buffer)
-        # Arsiv sinirini BLOCK'a yuvarla (stabilite icin)
-        archive_q = (archive_raw // block_size) * block_size
-        archive_cut = 0
-        for i in range(min(archive_q, n - 1), 0, -1):
-            if is_safe_boundary(msgs, i):
-                archive_cut = i
-                break
-        # Strict Append-Only Kilidi:
-        # hot_cut sinirini archive_cut'a gore sabitle.
-        # Boylece 48 blok boyunca cold_msgs asla buyumez/degismez, ortadaki mesajlar
-        # budanarak mutasyona ugramaz ve upstream KV cache %98+ isabetle stabil kalir.
-        hot_target = archive_cut + cold_buffer
-        hot_cut = hot_target
-        for i in range(min(hot_target, n - 1), archive_cut, -1):
-            if is_safe_boundary(msgs, i):
-                hot_cut = i
-                break
-        if hot_cut - archive_cut < 2:
-            hot_cut = archive_cut
+    # 1. Immutable Append-Only Ledger Zinciri
+    archive_result, archive_cut, methods_used = build_archive_chain(
+        msgs, key, block_size, settings, cold=cold
+    )
 
     if archive_cut < 8:
+        # Henuz ilk blok finalize edilmedi (veya kesim esigi altinda)
         return {"applied": False, "reason": f"kesim esigi altinda (mesaj={n}, archive_cut={archive_cut})",
                 "session": key, "cold": cold}
+
+    # 2. Soguk ve Sicak Dilim Sinirlari (Cold path ledger'i bozmaz, sadece tamponu/sicagi daraltir)
+    hot_target = archive_cut + (0 if cold else cold_buffer)
+    hot_cut = hot_target
+    for i in range(min(hot_target, n - 1), archive_cut, -1):
+        if is_safe_boundary(msgs, i):
+            hot_cut = i
+            break
+    if hot_cut - archive_cut < 2:
+        hot_cut = archive_cut
 
     archive_msgs = msgs[:archive_cut]
     cold_msgs = msgs[archive_cut:hot_cut] if hot_cut > archive_cut else []
     hot_msgs = msgs[hot_cut:]
 
-    # Prefix hash YALNIZCA arsiv diliminden hesaplanir
-    # Soguk ve sicak katmandaki degisiklikler hash'i ETKILEMEZ
-    archive_json_bytes = json.dumps(archive_msgs, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    prefix_hash = hashlib.sha256(archive_json_bytes).hexdigest()
-
-    # --- Arsiv katmanini ozetle veya cacheden al ---
-    cached = db.get_cached_prefix(prefix_hash)
-    if cached:
-        archive_result = cached["messages"]
-        summary_method = cached["summary_method"]
-        cache_hit = True
-    else:
-        # Cache miss: ozetleme ve budama
-        cache_hit = False
-        enable_ai = settings.get("enable_ai_summarizer", "true") == "true"
-        summarizer_mode = settings.get("summarizer_mode", "hybrid")
-        api_key = settings.get("ai_studio_api_key", "")
-        pref_model = settings.get("preferred_gemini_model", "gemini-3.1-flash-lite")
-
-        archive_result = []
-        summary_method = "deterministic"
-        summary_text = None
-
-        min_cut = 14 if cold else 16
-        if enable_ai and len(archive_msgs) >= min_cut and summarizer_mode != "deterministic":
-            safe_cut = extract_safe_user_boundary(archive_msgs, min_index=min_cut, max_index=len(archive_msgs) - 4)
-            if safe_cut and safe_cut >= min_cut:
-                slice_to_summarize = archive_msgs[:safe_cut]
-
-                # [A] Antigravity Ajan Koprusu
-                agent_summary = agent_bridge.check_agent_summary(prefix_hash)
-                if agent_summary:
-                    summary_text = agent_summary
-                    summary_method = "antigravity_agent"
-                else:
-                    agent_bridge.request_agent_summary(key, prefix_hash, slice_to_summarize, safe_cut, model=payload.get("model", ""))
-
-                    # [B] Fallback: Gemini Flash
-                    if (summarizer_mode in ("hybrid", "api_only")) and api_key:
-                        transcript_text = agent_bridge.format_transcript(slice_to_summarize)
-                        gemini_sum, status = agent_bridge.call_gemini_summary(transcript_text, api_key, pref_model)
-                        if gemini_sum:
-                            summary_text = gemini_sum
-                            summary_method = f"gemini_flash ({status})"
-
-                if summary_text:
-                    archive_result.append({
-                        "role": "user",
-                        "content": f"[Önceki Aşama ve Mimari Kararlar Özeti (1-{safe_cut}. Adımlar)]:\n\n{summary_text}"
-                    })
-                    archive_result.append({
-                        "role": "assistant",
-                        "content": "Önceki aşamalar, yapılan değişiklikler ve alınan mimari kararlar hafızamda. Kaldığımız yerden devam ediyorum."
-                    })
-                    # Kalan arsiv dilimini deterministik buda
-                    rem_pruned, _ = deterministic_prune_slice(archive_msgs[safe_cut:])
-                    archive_result.extend(rem_pruned)
-
-        if not archive_result:
-            archive_result, _ = deterministic_prune_slice(archive_msgs)
-            summary_method = "deterministic"
-
-        # Arsiv sonuna cache capasi ekle
-        archive_result = anchor_prefix_cache_control(archive_result)
-
-        # Tasarruf hesabi ve SQLite'a kaydet
-        orig_archive_len = len(archive_json_bytes)
-        pruned_archive_json = json.dumps(archive_result, ensure_ascii=False)
-        pruned_archive_len = len(pruned_archive_json.encode("utf-8"))
-        bytes_saved = max(0, orig_archive_len - pruned_archive_len)
-        tokens_saved = bytes_saved // 4
-        db.save_cached_prefix(prefix_hash, archive_result, tokens_saved, bytes_saved, summary_method)
-
-    # --- Soguk katmani deterministik buda ---
+    # 3. Soguk katmani deterministik buda
     if cold_msgs:
         cold_pruned, _ = deterministic_prune_slice(cold_msgs)
     else:
         cold_pruned = []
 
-    # --- Final payload olustur ---
-    final_messages = archive_result + cold_pruned + hot_msgs
+    # 4. Arsiv sonuna cache capasi ekle
+    archive_result_anchored = anchor_prefix_cache_control(archive_result)
+
+    # 5. Final payload olustur
+    final_messages = archive_result_anchored + cold_pruned + hot_msgs
     new_payload = dict(payload)
     new_payload["messages"] = final_messages
     normalize_cache_controls(new_payload)
     new_payload = sanitize_cache_control_budget(new_payload)
     body = json.dumps(new_payload, ensure_ascii=False).encode("utf-8")
 
+    # Tasarruf hesabi
+    orig_archive_len = len(json.dumps(archive_msgs, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+    pruned_archive_len = len(json.dumps(archive_result, ensure_ascii=False).encode("utf-8"))
+    bytes_saved = max(0, orig_archive_len - pruned_archive_len)
+    tokens_saved = bytes_saved // 4
+
+    summary_method_str = ", ".join(methods_used[-2:]) if methods_used else "ledger_chain"
+    prefix_hash = f"ledger_{key[:8]}_b{archive_cut}"
+
     with _LOCK:
         same_prefix = (st.get("prefix_hash") == prefix_hash)
         st["prefix_hash"] = prefix_hash
         st["cutoff"] = archive_cut
 
-    # Tasarruf: cache hit ise cached degerler, miss ise hesaplanan
-    if cache_hit:
-        tokens_saved = cached["tokens_saved"]
-        bytes_saved = cached["bytes_saved"]
-    # else: zaten yukarida hesaplandi
-
     return {
         "applied": True,
-        "cache_hit": cache_hit,
-        "reason": f"{'sqlite_prefix_cache' if cache_hit else 'pruned'} ({summary_method})",
+        "cache_hit": True,
+        "reason": f"ledger_chain ({summary_method_str})",
         "body": body,
         "session": key,
         "cold": cold,
@@ -563,11 +593,11 @@ def plan(payload, session_id=None):
         "hot_cut": hot_cut,
         "total_messages": n,
         "kept_messages": len(final_messages),
-        "prefix_hash": prefix_hash[:12],
+        "prefix_hash": prefix_hash,
         "prefix_stable": same_prefix,
         "tokens_saved": tokens_saved,
         "bytes_saved": bytes_saved,
-        "summary_method": summary_method,
+        "summary_method": summary_method_str,
         "stats": {"images": 0, "thinking": 0, "tool_results": 0, "skills": 0,
                   "saved_chars": bytes_saved,
                   "archive_msgs": len(archive_msgs), "cold_msgs": len(cold_msgs),

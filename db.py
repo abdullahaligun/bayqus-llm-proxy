@@ -47,10 +47,23 @@ def init_db():
         );
     """)
 
+    # 3. Oturum Blok Defteri (Session Ledger - Append-Only Zincir Sabitleyici)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS session_blocks (
+            session_key    TEXT NOT NULL,
+            block_index    INTEGER NOT NULL,
+            right_boundary INTEGER NOT NULL,
+            block_hash     TEXT NOT NULL,
+            created_at     TEXT NOT NULL,
+            PRIMARY KEY (session_key, block_index)
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_sb_session ON session_blocks(session_key, block_index);")
+
     # Varsayilan Ayarlar
     defaults = {
         "enable_pruning": "true",
-        "block_size": "48",
+        "block_size": "32",
         "keep_recent_messages": "40",
         "enable_ai_summarizer": "true",
         "summarizer_mode": "hybrid",  # hybrid | agent_only | api_only | deterministic
@@ -181,11 +194,46 @@ def get_cache_stats():
         return {"entries": 0, "total_hits": 0, "total_tokens_saved": 0, "total_bytes_saved": 0}
 
 
+def get_session_blocks(session_key):
+    """Sirali (block_index ARTAN) finalize edilmis blok listesi."""
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""SELECT block_index, right_boundary, block_hash
+                       FROM session_blocks WHERE session_key = ?
+                       ORDER BY block_index ASC""", (session_key,))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"[!] get_session_blocks hatasi: {e}")
+        return []
+
+
+def finalize_session_block(session_key, block_index, right_boundary, block_hash):
+    """Blok sinirini ve hash'ini deftere kalici olarak kilitler."""
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        now_iso = datetime.utcnow().isoformat()
+        cur.execute("""INSERT OR IGNORE INTO session_blocks
+                       (session_key, block_index, right_boundary, block_hash, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (session_key, block_index, right_boundary, block_hash, now_iso))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[!] finalize_session_block hatasi: {e}")
+        return False
+
+
 def clear_cache():
     try:
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("DELETE FROM pruned_prefix_cache")
+        cur.execute("DELETE FROM session_blocks")
         conn.commit()
         cur.execute("VACUUM")
         conn.commit()

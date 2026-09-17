@@ -188,25 +188,27 @@ def count_bridge_files():
     return {"pending": p, "ready": r}
 
 
-def call_gemini_summary(text_to_summarize, api_key, preferred_model="gemini-3.1-flash-lite"):
+def call_gemini_summary(text_to_summarize, api_key, preferred_model="gemini-3.1-flash-lite", block_index=None):
     """
-    Google AI Studio Fallback Çağrısı (Antigravity ajanı henüz yazmadıysa anında devreye girer).
+    Google AI Studio Fallback Çağrısı.
+    Tek bir aşamanın (delta blok) odaklı özetini 150-250 kelimede üretir.
     """
     if not api_key:
         return None, "no_api_key"
 
     models_to_try = [preferred_model] + [m for m in GEMINI_MODEL_POOL if m != preferred_model]
 
+    block_title = f"{block_index + 1}. Aşama" if block_index is not None else "Bu Aşama"
     prompt = (
-        "Sen uzman bir yazılım mimarı ve kıdemli teknik liderisin. Aşağıda uzun süredir devam eden bir yazılım geliştirme "
-        "oturumunun (Claude Code / AI Asistan) en kritik güncel aşamaları yer almaktadır.\n"
-        "Çok eski ara adımlar (eski derleme denemeleri, ara grep'ler) tamamlanmış ve temizlenmiştir. Senin görevin, modelin sonraki "
-        "adımlarda kaybolmaması için mevcut durumu aşağıdaki 3 başlık altında net, teknik ve yapılandırılmış bir Türkçe özet olarak çıkarmaktır:\n\n"
-        "1. **Proje & Temel Amaç**: Projenin adı ve çözülmeye çalışılan ana hedef.\n"
-        "2. **Son Tamamlanan Aşamalar & Değiştirilen Dosyalar**: Son aktif aşamada nelerin tamamlandığı, hangi dosyalarda ne gibi kritik değişiklikler/düzeltmeler yapıldığı.\n"
-        "3. **Aktif Mimari Kararlar & Sıradaki Odak**: Belirlenen kod mimarisi, devam eden işler ve ajanın sıradaki önceliği.\n\n"
+        f"Sen uzman bir yazılım mimarısın. Aşağıda bir yazılım geliştirme oturumunun yeni tamamlanan bir aşamasına "
+        f"({block_title}) ait adımlar yer almaktadır.\n"
+        "Görevin, sadece bu aşamada yapılan işleri aşağıdaki 3 başlık altında kısa, net, teknik ve yapılandırılmış bir "
+        "Türkçe özet olarak çıkarmaktır (~150-250 kelime):\n\n"
+        "1. **Bu Aşamada Yapılan İşler & Değiştirilen Dosyalar**: Hangi dosyalarda ne gibi kritik değişiklikler yapıldı.\n"
+        "2. **Kritik Hatalar & Çözümleri**: Bu aşamada karşılaşılan ve çözülen derleme/çalışma zamanı hataları.\n"
+        "3. **Ulaşılan Durum & Aktif Kararlar**: Bu aşamanın sonunda kodun ulaştığı kararlı durum ve mimari notlar.\n\n"
         "Gereksiz giriş veya selamlaşma ekleme, doğrudan 1. başlıkla başla.\n\n"
-        "--- GEÇMİŞ METİN BAŞLANGICI ---\n" + text_to_summarize[:400000] + "\n--- GEÇMİŞ METİN BİTİŞİ ---"
+        "--- AŞAMA METNİ BAŞLANGICI ---\n" + text_to_summarize[:150000] + "\n--- AŞAMA METNİ BİTİŞİ ---"
     )
 
     payload = {
@@ -214,8 +216,8 @@ def call_gemini_summary(text_to_summarize, api_key, preferred_model="gemini-3.1-
             "parts": [{"text": prompt}]
         }],
         "generationConfig": {
-            "maxOutputTokens": 800,
-            "temperature": 0.2
+            "maxOutputTokens": 600,
+            "temperature": 0.1
         }
     }
     body = json.dumps(payload).encode("utf-8")
