@@ -256,6 +256,20 @@ def finalize_session_block(session_key, block_index, right_boundary, block_hash)
         return False
 
 
+def clear_session_blocks(session_key):
+    """Oturum compact edildiginde veya gecmis degistiginde eski blok kayitlarini siler."""
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM session_blocks WHERE session_key = ?", (session_key,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[!] clear_session_blocks hatasi: {e}")
+        return False
+
+
 def record_request(session_id="", agent_id="", method="POST", path="/v1/messages",
                    status_code=200, duration_ms=0, model=None, model_sent=None,
                    route=None, upstream=None, system_prompt=None,

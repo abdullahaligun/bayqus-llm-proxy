@@ -248,6 +248,25 @@ def build_archive_chain(msgs, session_key, block_size, settings, cold=False):
     next_index = 0
     methods_used = []
 
+    # 0. Oturum gecerliligini dogrula (compact, geri sarma veya gecmis degisimi)
+    ledger_valid = True
+    p_check = 0
+    for row in ledger:
+        r_bound = row["right_boundary"]
+        b_hash = row["block_hash"]
+        if len(msgs) < r_bound:
+            ledger_valid = False
+            break
+        if _block_hash(msgs[p_check:r_bound]) != b_hash:
+            ledger_valid = False
+            break
+        p_check = r_bound
+
+    if not ledger_valid:
+        # Oturum compact edilmis veya mesajlar degismis; eski blok kayitlarini temizle
+        db.clear_session_blocks(session_key)
+        ledger = []
+
     # 1. Zaten finalize edilmis bloklari aynen ekle (SQLite ledger'dan, deterministik)
     for row in ledger:
         cached = db.get_cached_prefix(row["block_hash"])
@@ -592,8 +611,8 @@ def plan(payload, session_id=None):
         msgs, key, block_size, settings, cold=cold
     )
 
-    if archive_cut < 8:
-        # Henuz ilk blok finalize edilmedi (veya kesim esigi altinda)
+    if archive_cut < 8 or archive_cut >= n:
+        # Henuz ilk blok finalize edilmedi veya kesim esigi altinda / oturum boyutu yetersiz
         return {"applied": False, "reason": f"kesim esigi altinda (mesaj={n}, archive_cut={archive_cut})",
                 "session": key, "cold": cold}
 
