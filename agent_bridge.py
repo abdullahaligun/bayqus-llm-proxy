@@ -22,15 +22,15 @@ ssl_ctx = ssl.create_default_context()
 ssl_ctx.check_hostname = False
 ssl_ctx.verify_mode = ssl.CERT_NONE
 
-# Hizli ve yuksek kotalari olan ana donusum havuzu (Round-Robin)
+# Modeller Kalite ve Yetenek Sırasına Göre (En İyiden En Kötüye)
 ROTATION_POOL = [
-    "gemini-3.1-flash-lite",   # 15 RPM / 500 RPD
-    "gemini-3.5-flash-lite",   # 15 RPM / 500 RPD
-    "gemini-3-flash-preview",  # 5 RPM / 20 RPD
-    "gemini-3.5-flash",        # 5 RPM / 20 RPD
+    "gemini-3.5-flash",        # 1. En Yüksek Kalite Tam Flash (Akıl yürütme & mimari analiz)
+    "gemini-3-flash-preview",  # 2. Gemini 3.0 Tam Flash
+    "gemini-3.5-flash-lite",   # 3. Yeni Nesil Hızlı Lite (15 RPM / 500 RPD)
+    "gemini-3.1-flash-lite",   # 4. Kanıtlanmış Kararlı Lite (15 RPM / 500 RPD)
 ]
 
-# Ana modeller tukenirse veya gecikirse devreye girecek yedek havuz
+# Ana modeller tükendiğinde veya gecikirse devreye girecek yedek havuz
 FALLBACK_POOL = [
     "gemini-3.6-flash",
     "gemini-3.7-flash",
@@ -218,6 +218,9 @@ def call_gemini_summary(text_to_summarize, api_key, preferred_model="round-robin
             _rr_index = (_rr_index + 1) % len(ROTATION_POOL)
         rotated = ROTATION_POOL[start_idx:] + ROTATION_POOL[:start_idx]
         models_to_try = rotated + FALLBACK_POOL
+    elif preferred_model == "best-to-worst":
+        # Daima en kaliteli modelden baslar (Waterfall); kota/hata durumunda sirayla alt modele duser
+        models_to_try = ROTATION_POOL + FALLBACK_POOL
     else:
         all_models = ROTATION_POOL + FALLBACK_POOL
         models_to_try = [preferred_model] + [m for m in all_models if m != preferred_model]
