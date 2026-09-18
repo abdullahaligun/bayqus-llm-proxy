@@ -8,6 +8,7 @@ import time
 import ssl
 import urllib.request
 from datetime import datetime
+import threading
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 BRIDGE_DIR = os.path.join(DIR, "bridge")
@@ -21,16 +22,26 @@ ssl_ctx = ssl.create_default_context()
 ssl_ctx.check_hostname = False
 ssl_ctx.verify_mode = ssl.CERT_NONE
 
-GEMINI_MODEL_POOL = [
-    "gemini-3.1-flash-lite",
-    "gemini-3-flash-preview",
-    "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3.1-flash-lite-preview",
+# Hizli ve yuksek kotalari olan ana donusum havuzu (Round-Robin)
+ROTATION_POOL = [
+    "gemini-3.1-flash-lite",   # 15 RPM / 500 RPD
+    "gemini-3.5-flash-lite",   # 15 RPM / 500 RPD
+    "gemini-3-flash-preview",  # 5 RPM / 20 RPD
+    "gemini-3.5-flash",        # 5 RPM / 20 RPD
+]
+
+# Ana modeller tukenirse veya gecikirse devreye girecek yedek havuz
+FALLBACK_POOL = [
+    "gemini-3.6-flash",
     "gemini-3.7-flash",
     "gemini-3.8-flash",
     "gemini-flash-latest"
 ]
+
+GEMINI_MODEL_POOL = ROTATION_POOL + FALLBACK_POOL
+
+_rr_lock = threading.Lock()
+_rr_index = 0
 
 
 def format_transcript(messages, max_recent=500):
@@ -191,15 +202,25 @@ def count_bridge_files():
     return {"pending": p, "ready": r}
 
 
-def call_gemini_summary(text_to_summarize, api_key, preferred_model="gemini-3.1-flash-lite", block_index=None):
+def call_gemini_summary(text_to_summarize, api_key, preferred_model="round-robin", block_index=None):
     """
     Google AI Studio Fallback Çağrısı.
     Tek bir aşamanın (delta blok) odaklı özetini 150-250 kelimede üretir.
+    round-robin modunda istekler modeller arasinda donusumlu paylastirilarak rate limitler sifirlanir.
     """
     if not api_key:
         return None, "no_api_key"
 
-    models_to_try = [preferred_model] + [m for m in GEMINI_MODEL_POOL if m != preferred_model]
+    global _rr_index
+    if not preferred_model or preferred_model == "round-robin":
+        with _rr_lock:
+            start_idx = _rr_index
+            _rr_index = (_rr_index + 1) % len(ROTATION_POOL)
+        rotated = ROTATION_POOL[start_idx:] + ROTATION_POOL[:start_idx]
+        models_to_try = rotated + FALLBACK_POOL
+    else:
+        all_models = ROTATION_POOL + FALLBACK_POOL
+        models_to_try = [preferred_model] + [m for m in all_models if m != preferred_model]
 
     block_title = f"{block_index + 1}. Aşama" if block_index is not None else "Bu Aşama"
     prompt = (

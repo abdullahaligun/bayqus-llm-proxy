@@ -94,7 +94,7 @@ def init_db():
         "keep_recent_messages": "40",
         "enable_ai_summarizer": "true",
         "summarizer_mode": "hybrid",  # hybrid | agent_only | api_only | deterministic
-        "preferred_gemini_model": "gemini-3.1-flash-lite",
+        "preferred_gemini_model": "round-robin",
         "ai_studio_api_key": os.environ.get("GEMINI_API_KEY", os.environ.get("AI_STUDIO_API_KEY", "")),
         "history_retention_max": "5000",
     }

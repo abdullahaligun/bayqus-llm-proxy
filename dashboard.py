@@ -403,12 +403,14 @@ input:checked + .slider:before{transform:translateX(15px)}
           <div class="form-row">
             <label>Tercih Edilen Gemini Modeli (Fallback)</label>
             <select id="sum-model">
-              <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Hızlı & 1M Context)</option>
-              <option value="gemini-3-flash-preview">gemini-3-flash-preview (Gemini 3 Flash)</option>
-              <option value="gemini-3.7-flash">gemini-3.7-flash (Gemini 3.7 Flash)</option>
-              <option value="gemini-3.8-flash">gemini-3.8-flash (Gemini 3.8 Flash)</option>
-              <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
-              <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+              <option value="round-robin">🔄 Sırayla Dön (Round-Robin - Tüm Modelleri Dengeli Kullan)</option>
+              <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (15 RPM / 500 RPD)</option>
+              <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (15 RPM / 500 RPD)</option>
+              <option value="gemini-3-flash-preview">gemini-3-flash-preview (5 RPM / 20 RPD)</option>
+              <option value="gemini-3.5-flash">gemini-3.5-flash (5 RPM / 20 RPD)</option>
+              <option value="gemini-3.6-flash">gemini-3.6-flash (5 RPM / 20 RPD)</option>
+              <option value="gemini-3.7-flash">gemini-3.7-flash (Akıl Yürütme)</option>
+              <option value="gemini-3.8-flash">gemini-3.8-flash (Akıl Yürütme)</option>
               <option value="gemini-flash-latest">gemini-flash-latest</option>
             </select>
           </div>
@@ -1595,7 +1597,7 @@ function renderSummarizerTab(d){
   const keyInput = document.getElementById('sum-api-key');
   if(document.activeElement !== keyInput && keyInput){
     document.getElementById('sum-mode').value = s.summarizer_mode || 'hybrid';
-    document.getElementById('sum-model').value = s.preferred_gemini_model || 'gemini-3.1-flash-lite';
+    document.getElementById('sum-model').value = s.preferred_gemini_model || 'round-robin';
     document.getElementById('sum-block').value = s.block_size || '16';
     document.getElementById('sum-keep-recent').value = s.keep_recent_messages || '24';
     if(s.masked_api_key && !keyInput.dataset.edited){
