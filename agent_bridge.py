@@ -4,6 +4,7 @@ Proxy ile Antigravity ajanları arasında dosya tabanlı (dropzone) özet ileti�
 """
 import os
 import json
+import re
 import time
 import ssl
 import urllib.request
@@ -44,10 +45,15 @@ _rr_lock = threading.Lock()
 _rr_index = 0
 
 
+TOKEN_PING_PATTERN = re.compile(r'<total_tokens>.*?</total_tokens>', re.DOTALL | re.IGNORECASE)
+
+
 def format_transcript(messages, max_recent=500):
     """
     Mesaj dizisini ozetleyici ajanin en rahat okuyacagi temiz metne cevirir.
     Aktif Ufuk ve Eski Adimlari Unutturma (Rolling Horizon & Purge):
+    - Sentetik <total_tokens> pinglemesini ve telemetri gurultusunu tamamen eler.
+    - Adim sayilarini (1. Adim, 2. Adim...) sentetik bosluklar olmadan dogal siralar.
     - Ilk 2 mesaji (proje ana amaci ve baslangic talimati) daima korur.
     - Aradaki cok eski ara adimlari (1000+ mesaj oncesi log/grep/gecici hatalar) unutturur.
     - Kesim noktasina kadar olan son max_recent mesaji detayli inceler (256K+ baglam).
@@ -55,31 +61,67 @@ def format_transcript(messages, max_recent=500):
     if not messages:
         return ""
 
+    # 0. Sentetik <total_tokens> etiketlerini ve sadece bu etiketi iceren mesajlari temizle
+    clean_msgs = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content", "")
+        if isinstance(c, str):
+            clean_c = TOKEN_PING_PATTERN.sub("", c).strip()
+            if clean_c:
+                m_c = dict(m)
+                m_c["content"] = clean_c
+                clean_msgs.append(m_c)
+        elif isinstance(c, list):
+            new_blocks = []
+            for b in c:
+                if isinstance(b, dict):
+                    if b.get("type") == "text":
+                        b_txt = TOKEN_PING_PATTERN.sub("", b.get("text", "")).strip()
+                        if b_txt:
+                            b_copy = dict(b)
+                            b_copy["text"] = b_txt
+                            new_blocks.append(b_copy)
+                    else:
+                        new_blocks.append(b)
+            if new_blocks:
+                m_c = dict(m)
+                m_c["content"] = new_blocks
+                clean_msgs.append(m_c)
+        else:
+            clean_msgs.append(m)
+
+    if not clean_msgs:
+        return ""
+    messages = clean_msgs
+
     parts = []
+    step_num = 1
+
     # 1. Proje baslangic amaci (Ilk 1-2 mesaj)
     first_msgs = messages[:2]
     parts.append("=== PROJE BASLANGIC AMACI VE ILK TALIMATLAR ===")
-    for i, m in enumerate(first_msgs):
+    for m in first_msgs:
         role = m.get("role", "unknown")
         content = m.get("content", "")
         if isinstance(content, list):
             txts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
             content = " ".join(txts)
-        parts.append(f"[{i+1}. Adim - {role}]: {str(content)[:1200]}")
+        parts.append(f"[{step_num}. Adim - {role}]: {str(content)[:1200]}")
+        step_num += 1
 
     # 2. Aradaki cok eski adimlar elenir (Purge / Unutturma)
     if len(messages) > max_recent + 2:
         skipped = len(messages) - (max_recent + 2)
         parts.append(f"\n[... Onceki {skipped:,} ara adim basariyla tamamlandi ve gurultuyu onlemek icin arsivden elendi ...]\n")
         recent_msgs = messages[-max_recent:]
-        start_idx = len(messages) - max_recent
     else:
         recent_msgs = messages[2:]
-        start_idx = 2
 
     # 3. Son aktif asama ve mimari adimlar
     parts.append("=== SON AKTIF ASAMA VE MIMARI ADIMLAR ===")
-    for i, m in enumerate(recent_msgs, start=start_idx + 1):
+    for m in recent_msgs:
         role = m.get("role", "unknown")
         content = m.get("content", "")
         if isinstance(content, list):
@@ -95,7 +137,8 @@ def format_transcript(messages, max_recent=500):
                         if isinstance(res_c, str):
                             txts.append(f"[Sonuc: {res_c[:200]}]")
             content = " ".join(txts)
-        parts.append(f"[{i}. Adim - {role}]: {str(content)[:500]}")
+        parts.append(f"[{step_num}. Adim - {role}]: {str(content)[:500]}")
+        step_num += 1
 
     return "\n".join(parts)
 
@@ -243,7 +286,7 @@ def call_gemini_summary(text_to_summarize, api_key, preferred_model="round-robin
             "parts": [{"text": prompt}]
         }],
         "generationConfig": {
-            "maxOutputTokens": 600,
+            "maxOutputTokens": 2048,
             "temperature": 0.1
         }
     }
@@ -253,15 +296,23 @@ def call_gemini_summary(text_to_summarize, api_key, preferred_model="round-robin
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
         try:
-            with urllib.request.urlopen(req, context=ssl_ctx, timeout=12) as resp:
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=15) as resp:
                 resp_json = json.loads(resp.read().decode("utf-8"))
                 candidates = resp_json.get("candidates", [])
                 if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
+                    cand = candidates[0]
+                    finish_reason = cand.get("finishReason")
+                    # Eğer model token sınırına çarpıp yarıda kesildiyse sonraki modele geç
+                    if finish_reason == "MAX_TOKENS":
+                        continue
+
+                    parts = cand.get("content", {}).get("parts", [])
                     if parts and "text" in parts[0]:
                         summary = parts[0]["text"].strip()
-                        return summary, f"ok ({model})"
-        except urllib.error.HTTPError as e:
+                        # Minimum kalite denetimi: 120 karakterden kısa veya yarım kalmış çıktıları reddet
+                        if len(summary) >= 120:
+                            return summary, f"ok ({model})"
+        except urllib.error.HTTPError:
             continue
         except Exception:
             continue

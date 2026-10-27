@@ -149,8 +149,17 @@ input:checked + .slider:before{transform:translateX(15px)}
 /* MCP Management Styling */
 .mcp-bar{padding:10px 18px;background:rgba(0,0,0,0.02);border-bottom:1px solid var(--line);font-size:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
 .mcp-server-item{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 12px;display:flex;align-items:flex-start;gap:8px;font-size:11.5px;transition:background 0.15s}
-.mcp-server-item:hover{background:var(--bg2)}
 .mcp-server-item.disabled{opacity:0.65;background:var(--bg)}
+
+/* Memory Tab Styling */
+.mem-proj-item{padding:9px 12px;border-radius:6px;border:1px solid transparent;cursor:pointer;transition:all 0.15s;display:flex;flex-direction:column;gap:3px}
+.mem-proj-item:hover{background:var(--bg2);border-color:var(--line)}
+.mem-proj-item.active{background:rgba(217,119,6,0.1);border-color:var(--acc)}
+.mem-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px;display:flex;flex-direction:column;gap:8px;transition:box-shadow 0.15s}
+.mem-card:hover{box-shadow:0 4px 12px rgba(0,0,0,0.06);border-color:var(--dim)}
+.mem-badge-feedback{background:rgba(239,68,68,0.12);color:#ef4444;border:1px solid rgba(239,68,68,0.25)}
+.mem-badge-project{background:rgba(59,130,246,0.12);color:#3b82f6;border:1px solid rgba(59,130,246,0.25)}
+.mem-badge-reference{background:rgba(168,85,247,0.12);color:#a855f7;border:1px solid rgba(168,85,247,0.25)}
 </style>
 </head>
 <body>
@@ -190,6 +199,7 @@ input:checked + .slider:before{transform:translateX(15px)}
   <button class="tab-btn" data-tab="tab-analytics">📊 Analiz & Metrikler</button>
   <button class="tab-btn" data-tab="tab-routes">⚙️ Rota Tanımları</button>
   <button class="tab-btn" data-tab="tab-summarizer">🧠 Akıllı Özetleyici & Prefix Cache</button>
+  <button class="tab-btn" data-tab="tab-memory" onclick="loadMemoriesTab()">💾 Proje Hafızası (Memory)</button>
 </nav>
 
 <main>
@@ -449,6 +459,8 @@ input:checked + .slider:before{transform:translateX(15px)}
     <!-- Antigravity Ajan Kuyruğu Tablosu -->
     <h2>Antigravity Ajan Kuyruğu (Bekleyen Özet İstekleri)</h2>
     <div id="pending-summaries-wrap"></div>
+  </section>
+
   <!-- TAB: İSTEK GEÇMİŞİ & MESAJ İÇERİKLERİ (SON 5000) -->
   <section id="tab-history" class="tab-content">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">
@@ -496,7 +508,198 @@ input:checked + .slider:before{transform:translateX(15px)}
     </div>
   </section>
 
+  <!-- TAB 7: PROJE HAFIZASI (MEMORY) -->
+  <section id="tab-memory" class="tab-content">
+    <div style="background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 18px;margin-bottom:18px">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+        <div>
+          <div style="font-weight:700;font-size:14.5px;display:flex;align-items:center;gap:8px">
+            <span>💾 Claude Proje Hafızası (MEMORY.md & Konu Kartları)</span>
+            <span class="badge badge-ok">Canlı Entegrasyon</span>
+          </div>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px">
+            Claude Desktop & Code'un <code>~/.claude/projects/&lt;proje&gt;/memory/</code> altındaki kalıcı mimari kararlarını, kural ve kısıtlamalarını yönetin.<br>
+            Buradaki hafıza maddeleri <b>resmi abonelikte veya proxy üzerinden</b> her oturumda modele otomatik olarak enjekte edilir.
+          </div>
+        </div>
+        <div class="btn-group">
+          <button class="primary" onclick="openMemoryModal()">➕ Yeni Kural / Kart Ekle</button>
+          <button onclick="openExtractModal()">⚡ AI ile Hafıza Çıkar</button>
+          <button onclick="loadMemoriesTab()">🔄 Yenile</button>
+        </div>
+    <!-- RAG Hafıza Bilgi & Kontrol Barı -->
+    <div style="background:var(--bg2);border:1px solid var(--line);border-radius:var(--radius);padding:12px 16px;margin-bottom:18px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <span style="font-size:22px">🧠</span>
+        <div>
+          <div style="font-weight:700;font-size:13.5px;display:flex;align-items:center;gap:8px">
+            <span>Dinamik RAG Hafıza Enjeksiyonu (Anti-Bloat & BM25)</span>
+            <span id="rag-status-badge" class="badge badge-ok">Aktif</span>
+          </div>
+          <div style="font-size:11.5px;color:var(--dim);margin-top:2px">
+            29 KB'lık devasa kartların tamamı basılmaz; kullanıcının o an konuştuğu konuya göre en alakalı 1–2 kural (maksimum ~600 token) anlık süzülür. Alakasız konuşmalarda 0 token harcanır.
+          </div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <button id="btn-rag-toggle" class="sm" onclick="toggleRagMemory()">🟢 RAG Açık</button>
+        <button class="sm" onclick="openRagTestModal()">🧪 Canlı RAG Testi</button>
+      </div>
+    </div>
+
+    <!-- 2 Sütunlu Grid: Sol Projeler, Sağ Hafıza Dosyaları ve Detayı -->
+    <div style="display:grid;grid-template-columns:320px 1fr;gap:18px;align-items:start">
+      
+      <!-- Sol: Projeler Listesi -->
+      <div class="card" style="padding:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <b style="font-size:13px">📁 Projeler</b>
+          <span id="mem-proj-count" class="badge badge-dim">0 proje</span>
+        </div>
+        <input type="text" id="mem-proj-search" placeholder="Proje filtrele..." style="width:100%;margin-bottom:10px" oninput="filterMemoryProjects()">
+        <div id="mem-project-list" style="display:flex;flex-direction:column;gap:6px;max-height:68vh;overflow-y:auto;padding-right:4px">
+          <div class="dim" style="padding:20px;text-align:center">Projeler yükleniyor...</div>
+        </div>
+      </div>
+
+      <!-- Sağ: Seçili Proje Hafızası -->
+      <div class="card" style="padding:16px;min-height:550px">
+        <div id="mem-detail-header" style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:14px">
+          <div>
+            <h3 id="mem-detail-title" style="margin:0;font-size:16px">Lütfen bir proje seçin</h3>
+            <div id="mem-detail-path" class="dim mono" style="font-size:11px;margin-top:2px"></div>
+          </div>
+          <div class="btn-group" id="mem-subtab-btns" style="display:none">
+            <button class="sm active" id="btn-subtab-cards" onclick="switchMemSubtab('cards')">📚 Konu Kartları</button>
+            <button class="sm" id="btn-subtab-index" onclick="switchMemSubtab('index')">📝 MEMORY.md İndeksi</button>
+          </div>
+        </div>
+
+        <!-- Alt Sekme 1: Kartlar -->
+        <div id="mem-subtab-cards-view">
+          <div id="mem-cards-grid" style="display:grid;grid-template-columns:repeat(auto-fill, minmax(280px, 1fr));gap:12px">
+            <div class="empty">Soldaki listeden bir proje seçerek hafıza kartlarını görüntüleyin.</div>
+          </div>
+        </div>
+
+        <!-- Alt Sekme 2: MEMORY.md Editor -->
+        <div id="mem-subtab-index-view" style="display:none">
+          <div style="margin-bottom:10px;font-size:12px;color:var(--dim)">
+            Claude her oturum başladığında ilk olarak bu <b>MEMORY.md</b> dosyasını okur ve ilgili konu kartlarını gerektiğinde yükler.
+          </div>
+          <textarea id="mem-index-editor" rows="18" class="mono" style="width:100%;font-size:12px;margin-bottom:12px"></textarea>
+          <div style="display:flex;justify-content:flex-end;gap:8px">
+            <button class="primary" onclick="saveMemoryIndex()">💾 MEMORY.md'yi Kaydet</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
 </main>
+
+<!-- MODAL: HAFIZA KARTI DÜZENLE / EKLE -->
+<div class="modal-overlay" id="memory-edit-modal" onclick="if(event.target===this)closeModal('memory-edit-modal')">
+  <div class="modal" style="max-width:760px">
+    <div class="modal-header">
+      <h3 class="modal-title" id="mem-modal-title">Hafıza Kartı Düzenle</h3>
+      <button class="close-btn" onclick="closeModal('memory-edit-modal')">&times;</button>
+    </div>
+    <form onsubmit="submitMemoryCard(event)">
+      <input type="hidden" id="mem-form-project-id">
+      <div class="form-row">
+        <label>Dosya Adı (Kebab-case, örn: feedback-em-dash-yok.md)</label>
+        <input type="text" id="mem-form-filename" required placeholder="ornek-kural.md">
+      </div>
+      <div class="form-row" style="display:grid;grid-template-columns:1fr 140px;gap:10px">
+        <div>
+          <label>Kısa Başlık / Tanım</label>
+          <input type="text" id="mem-form-title" placeholder="Em Dash Yasağı">
+        </div>
+        <div>
+          <label>Tür (Type)</label>
+          <select id="mem-form-type">
+            <option value="project">project (Mimari)</option>
+            <option value="feedback">feedback (Kural/Geri Bildirim)</option>
+            <option value="reference">reference (Referans)</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>MEMORY.md İndeks Açıklaması (Tek satır özet)</label>
+        <input type="text" id="mem-form-desc" placeholder="Raporlarda em dash kullanılmaz, doğal Türkçe kalıplar esas alınır">
+      </div>
+      <div class="form-row">
+        <label>İçerik (Markdown)</label>
+        <textarea id="mem-form-content" rows="12" class="mono" style="width:100%;font-size:12px" placeholder="## Neden (Why) ve Nasıl Uygulanır (How)..."></textarea>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px">
+        <button type="button" onclick="closeModal('memory-edit-modal')">İptal</button>
+        <button type="submit" class="primary">Kaydet & Senkronize Et</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- MODAL: AI İLE HAFIZA ÇIKARICI -->
+<div class="modal-overlay" id="memory-extract-modal" onclick="if(event.target===this)closeModal('memory-extract-modal')">
+  <div class="modal" style="max-width:700px">
+    <div class="modal-header">
+      <h3 class="modal-title">⚡ Yapay Zekâ ile Oturumdan Hafıza Çıkar</h3>
+      <button class="close-btn" onclick="closeModal('memory-extract-modal')">&times;</button>
+    </div>
+    <div style="font-size:12px;color:var(--dim);margin-bottom:14px">
+      Konuşma geçmişini Gemini Flash ile tarayarak kritik mimari kararları, kuralları ve çözümleri otomatik süzüp projenin <code>MEMORY.md</code> kütüğüne ekler.
+    </div>
+    <div class="form-row">
+      <label>Hedef Proje</label>
+      <select id="mem-extract-project" style="width:100%"></select>
+    </div>
+    <div class="form-row">
+      <label>Kaynak: Son Oturumlardan Seç</label>
+      <select id="mem-extract-session" style="width:100%">
+        <option value="">— Oturum Seçin veya Aşağıya Metin Yapıştırın —</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>Veya Doğrudan Analiz Edilecek Metin / Kararlar</label>
+      <textarea id="mem-extract-text" rows="7" placeholder="İsteğe bağlı: Oturum seçmek yerine doğrudan toplantı notu, kural veya metin yapıştırabilirsiniz..." style="width:100%;font-size:12px"></textarea>
+    </div>
+    <div id="mem-extract-status" style="margin:10px 0;font-size:12px"></div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px">
+      <button type="button" onclick="closeModal('memory-extract-modal')">Kapat</button>
+      <button type="button" id="btn-run-extract" class="primary" onclick="runMemoryExtract()">✨ Hafıza Çıkar & Ekle</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: RAG CANLI TESTİ -->
+<div class="modal-overlay" id="memory-rag-modal" onclick="if(event.target===this)closeModal('memory-rag-modal')">
+  <div class="modal" style="max-width:760px">
+    <div class="modal-header">
+      <h3 class="modal-title">🧪 RAG Hafıza Arama Simülasyonu</h3>
+      <button class="close-btn" onclick="closeModal('memory-rag-modal')">&times;</button>
+    </div>
+    <div style="font-size:12px;color:var(--dim);margin-bottom:14px">
+      Herhangi bir kullanıcı mesajı veya prompt yazın; RAG motorunun bu mesaj için hangi kural kartlarını seçeceğini, alaka puanını ve harcanacak tahmini token miktarını anında görün.
+    </div>
+    <div class="form-row">
+      <label>Seçili Proje</label>
+      <input type="text" id="rag-test-project" readonly class="mono" style="width:100%;font-size:12px">
+    </div>
+    <div class="form-row">
+      <label>Örnek Kullanıcı Mesajı / Prompt</label>
+      <div style="display:flex;gap:8px">
+        <input type="text" id="rag-test-query" placeholder="örn: Canlı prod DB'ye bağlanıp tabloyu güncelleyelim..." style="flex:1" onkeydown="if(event.key==='Enter')runRagTest()">
+        <button class="primary" onclick="runRagTest()">🔍 Test Et</button>
+      </div>
+    </div>
+    <div id="rag-test-results" style="margin-top:14px">
+      <div class="dim" style="text-align:center;padding:20px">Test etmek için yukarıya bir mesaj yazıp arayın.</div>
+    </div>
+  </div>
+</div>
 
 <!-- MODAL: İSTEK DETAY İNCELEYİCİ (INSPECTOR) -->
 <div class="modal-overlay" id="inspector-modal" onclick="if(event.target===this)closeModal('inspector-modal')">
@@ -610,7 +813,11 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));
     btn.classList.add('active');
-    document.getElementById(btn.dataset.tab).classList.add('active');
+    const target = document.getElementById(btn.dataset.tab);
+    if (target) target.classList.add('active');
+    if (btn.dataset.tab === 'tab-memory' && typeof loadMemoriesTab === 'function') {
+      loadMemoriesTab();
+    }
   });
 });
 
@@ -747,16 +954,23 @@ function renderSessionsTab(d, defRoute){
             : s.yas_sn < 3600 ? Math.round(s.yas_sn/60) + ' dk önce'
             : Math.round(s.yas_sn/3600) + ' sa önce';
 
+          const pruneBtn = s.prune_disabled
+            ? `<button class="sm danger" onclick="toggleSessionPrune('${esc(s.id)}', true)" title="Budama KAPALI (Açmak için tıkla)">✂️ Kapalı</button>`
+            : `<button class="sm" onclick="toggleSessionPrune('${esc(s.id)}', false)" title="Budama AÇIK (Kapatmak için tıkla)">✂️ Açık</button>`;
+
           const quickBtns = `
             <div class="btn-group">
               <button class="sm ${sCur==='abonelik'?'primary':''}" onclick="pinSessionDirect('${esc(s.id)}', 'abonelik')" title="Abonelik">🟢</button>
               <button class="sm ${sCur==='gateway'?'primary':''}" onclick="pinSessionDirect('${esc(s.id)}', 'gateway')" title="Gateway">🏢</button>
               ${sCur ? `<button class="sm danger" onclick="pinSessionDirect('${esc(s.id)}', '')" title="Gruba devret">↺</button>` : ''}
+              ${pruneBtn}
             </div>
           `;
 
+          const pruneBadge = s.prune_disabled ? ' <span class="badge badge-warn" style="font-size:10px">✂️ Budama Kapalı</span>' : '';
+
           return [
-            `<div><b>💬 ${esc(s.title)}</b><div class="dim mono" style="font-size:10.5px">${esc(s.cwd)}</div></div>`,
+            `<div><b>💬 ${esc(s.title)}</b>${pruneBadge}<div class="dim mono" style="font-size:10.5px">${esc(s.cwd)}</div></div>`,
             sBadge + `<div class="dim" style="font-size:10.5px">${esc(s.kaynak)}</div>`,
             `<select data-sid="${esc(s.id)}">${sOpts}</select>`,
             `<div><select data-sub-sid="${esc(s.id)}">${sSubOpts}</select><div class="dim" style="font-size:10.5px;margin-top:2px">${esc(s.subagent_kaynak)}</div></div>`,
@@ -875,13 +1089,19 @@ function renderSessionsTab(d, defRoute){
         ? '<span class="badge badge-ok">🟢 abonelik</span>'
         : r.etkin ? `<span class="badge badge-purple">${esc(r.etkin)}</span>` : `<span class="dim">varsayılan (${esc(defRoute)})</span>`;
 
-      const idCell = `<div><b>💬 ${esc(r.title || r.kisa)}</b>${r.group ? ` <span class="badge badge-dim">${esc(r.group)}</span>` : ''}<br><span class="mono dim" style="font-size:10.5px">${esc(r.kisa)}</span></div>`;
+      const pruneBadge = r.prune_disabled ? ' <span class="badge badge-warn" style="font-size:10px">✂️ Budama Kapalı</span>' : '';
+      const idCell = `<div><b>💬 ${esc(r.title || r.kisa)}</b>${r.group ? ` <span class="badge badge-dim">${esc(r.group)}</span>` : ''}${pruneBadge}<br><span class="mono dim" style="font-size:10.5px">${esc(r.kisa)}</span></div>`;
+
+      const pruneBtn = r.prune_disabled
+        ? `<button class="sm danger" onclick="toggleSessionPrune('${esc(r.id)}', true)" title="Budama KAPALI (Açmak için tıkla)">✂️ Kapalı</button>`
+        : `<button class="sm" onclick="toggleSessionPrune('${esc(r.id)}', false)" title="Budama AÇIK (Kapatmak için tıkla)">✂️ Açık</button>`;
 
       const quickBtns = `
         <div class="btn-group">
           <button class="sm ${r.sabit==='abonelik'?'primary':''}" onclick="pinSessionDirect('${esc(r.id)}', 'abonelik')">🟢</button>
           <button class="sm ${r.sabit==='gateway'?'primary':''}" onclick="pinSessionDirect('${esc(r.id)}', 'gateway')">🏢</button>
           ${r.sabit ? `<button class="sm danger" onclick="pinSessionDirect('${esc(r.id)}', '')" title="Sabitlemeyi kaldır">↺</button>` : ''}
+          ${pruneBtn}
         </div>
       `;
 
@@ -1062,6 +1282,16 @@ async function pinSessionDirect(sid, route){
     await fetch('/__bayqus/pin', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({session: sid, route})
+    });
+    tick(true);
+  }catch(e){ alert(e.message); }
+}
+
+async function toggleSessionPrune(sid, enablePruning){
+  try{
+    await fetch('/__bayqus/session-prune', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({session: sid, enabled: enablePruning})
     });
     tick(true);
   }catch(e){ alert(e.message); }
@@ -1920,6 +2150,454 @@ async function clearAllHistory() {
     loadHistory(0);
   } catch (err) {
     alert('Hata: ' + err.message);
+  }
+}
+
+// --------------------------------------------------------------------------
+// 7. PROJE HAFIZASI (MEMORY) TAB
+// --------------------------------------------------------------------------
+let MEMORY_PROJECTS = [];
+let CURRENT_PROJECT_ID = null;
+let CURRENT_PROJECT_DATA = null;
+
+async function loadMemoriesTab() {
+  const pList = document.getElementById('mem-project-list');
+  pList.innerHTML = '<div class="dim" style="padding:20px;text-align:center">Projeler taranıyor...</div>';
+  try {
+    const res = await fetch('/__bayqus/memories');
+    const j = await res.json();
+    if (!j.ok) throw new Error(j.mesaj || 'Projeler alınamadı');
+    MEMORY_PROJECTS = j.projects || [];
+    renderMemoryProjects();
+
+    // Otomatik ilk projeyi seç (hafızası olan varsa onu önceliklendir)
+    if (!CURRENT_PROJECT_ID && MEMORY_PROJECTS.length > 0) {
+      const best = MEMORY_PROJECTS.find(p => p.has_memory && p.files_count > 0) || MEMORY_PROJECTS[0];
+      selectMemoryProject(best.id);
+    } else if (CURRENT_PROJECT_ID) {
+      selectMemoryProject(CURRENT_PROJECT_ID);
+    }
+  } catch (err) {
+    pList.innerHTML = `<div class="empty bad">Yükleme hatası: ${esc(err.message)}</div>`;
+  }
+}
+
+function filterMemoryProjects() {
+  renderMemoryProjects();
+}
+
+function renderMemoryProjects() {
+  const pList = document.getElementById('mem-project-list');
+  const q = (document.getElementById('mem-proj-search')?.value || '').toLowerCase().trim();
+  const filtered = MEMORY_PROJECTS.filter(p => !q || p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q));
+  
+  const countEl = document.getElementById('mem-proj-count');
+  if (countEl) countEl.textContent = `${filtered.length} / ${MEMORY_PROJECTS.length} proje`;
+
+  if (!filtered.length) {
+    pList.innerHTML = '<div class="empty">Eşleşen proje bulunamadı.</div>';
+    return;
+  }
+
+  pList.innerHTML = filtered.map(p => {
+    const isAct = p.id === CURRENT_PROJECT_ID;
+    const badge = p.has_memory
+      ? `<span class="badge badge-ok" style="font-size:10.5px">${p.files_count} dosya</span>`
+      : `<span class="badge badge-dim" style="font-size:10.5px">hafızasız</span>`;
+    return `
+      <div class="mem-proj-item ${isAct ? 'active' : ''}" onclick="selectMemoryProject('${encodeURIComponent(p.id)}')">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+          <b style="font-size:12.5px">${esc(p.name)}</b>
+          ${badge}
+        </div>
+        <div class="dim mono" style="font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(p.path)}">${esc(p.path)}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function selectMemoryProject(rawPid) {
+  const pid = decodeURIComponent(rawPid);
+  CURRENT_PROJECT_ID = pid;
+  renderMemoryProjects();
+
+  const titleEl = document.getElementById('mem-detail-title');
+  const pathEl = document.getElementById('mem-detail-path');
+  const cardsWrap = document.getElementById('mem-cards-grid');
+  const subBtns = document.getElementById('mem-subtab-btns');
+
+  const pObj = MEMORY_PROJECTS.find(p => p.id === pid);
+  if (titleEl) titleEl.textContent = pObj ? `📁 ${pObj.name}` : `📁 ${pid}`;
+  if (pathEl) pathEl.textContent = pObj ? pObj.path : pid;
+  if (subBtns) subBtns.style.display = 'inline-flex';
+
+  cardsWrap.innerHTML = '<div class="empty">Hafıza kartları yükleniyor...</div>';
+
+  try {
+    const res = await fetch(`/__bayqus/memory-project?id=${encodeURIComponent(pid)}`);
+    const j = await res.json();
+    if (!j.ok) throw new Error(j.mesaj || 'Proje hafızası okunamadı');
+    CURRENT_PROJECT_DATA = j.data;
+
+    // MEMORY.md editörünü doldur
+    const ed = document.getElementById('mem-index-editor');
+    if (ed) ed.value = CURRENT_PROJECT_DATA.memory_md || '';
+
+    // Kartları çiz
+    renderMemoryCards(CURRENT_PROJECT_DATA.files || []);
+  } catch (err) {
+    cardsWrap.innerHTML = `<div class="empty bad">Hata: ${esc(err.message)}</div>`;
+  }
+}
+
+function switchMemSubtab(which) {
+  const cardsView = document.getElementById('mem-subtab-cards-view');
+  const indexView = document.getElementById('mem-subtab-index-view');
+  const btnCards = document.getElementById('btn-subtab-cards');
+  const btnIndex = document.getElementById('btn-subtab-index');
+
+  if (which === 'cards') {
+    cardsView.style.display = 'block';
+    indexView.style.display = 'none';
+    btnCards.className = 'sm active';
+    btnIndex.className = 'sm';
+  } else {
+    cardsView.style.display = 'none';
+    indexView.style.display = 'block';
+    btnCards.className = 'sm';
+    btnIndex.className = 'sm active';
+  }
+}
+
+function renderMemoryCards(files) {
+  const wrap = document.getElementById('mem-cards-grid');
+  if (!files || !files.length) {
+    wrap.innerHTML = `
+      <div class="empty" style="grid-column:1/-1;padding:40px">
+        Bu projede henüz kayıtlı hafıza kartı bulunmuyor.<br>
+        <button class="primary" style="margin-top:12px" onclick="openMemoryModal()">➕ İlk Hafıza Kartını Ekle</button>
+        <button style="margin-top:12px;margin-left:8px" onclick="openExtractModal()">⚡ AI ile Oturumdan Çıkar</button>
+      </div>
+    `;
+    return;
+  }
+
+  wrap.innerHTML = files.map(f => {
+    const typeClass = f.type === 'feedback' ? 'mem-badge-feedback' : f.type === 'reference' ? 'mem-badge-reference' : 'mem-badge-project';
+    const typeLabel = f.type === 'feedback' ? 'Kural / Geri Bildirim' : f.type === 'reference' ? 'Referans' : 'Mimari';
+    const cardTitle = f.name || f.filename.replace('.md', '');
+    const shortDesc = f.description || (f.body ? f.body.slice(0, 120) : 'Açıklama yok');
+
+    return `
+      <div class="mem-card">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+          <div>
+            <span class="badge ${typeClass}" style="font-size:10px">${esc(typeLabel)}</span>
+            <div style="font-weight:700;font-size:13.5px;margin-top:4px;word-break:break-word">${esc(cardTitle)}</div>
+          </div>
+          <div class="btn-group">
+            <button class="sm" onclick="openMemoryModal('${encodeURIComponent(f.filename)}')" title="Düzenle">✏️</button>
+            <button class="sm danger" onclick="deleteMemoryCard('${encodeURIComponent(f.filename)}')" title="Sil">🗑️</button>
+          </div>
+        </div>
+
+        <div style="font-size:12px;color:var(--dim);line-height:1.4;flex:1;word-break:break-word">
+          ${esc(shortDesc)}
+        </div>
+
+        <details style="font-size:11.5px;border-top:1px solid var(--line);padding-top:6px;margin-top:4px">
+          <summary style="cursor:pointer;color:var(--acc);font-weight:600">İçeriği Gör (${N(f.size_bytes)} B)</summary>
+          <pre style="white-space:pre-wrap;background:var(--bg);padding:8px;border-radius:4px;margin-top:6px;font-size:11px;max-height:220px;overflow-y:auto">${esc(f.content)}</pre>
+        </details>
+      </div>
+    `;
+  }).join('');
+}
+
+function openMemoryModal(rawFname=null) {
+  const fname = rawFname ? decodeURIComponent(rawFname) : null;
+  if (!CURRENT_PROJECT_ID) {
+    alert('Lütfen önce soldaki listeden bir proje seçin.');
+    return;
+  }
+  document.getElementById('mem-form-project-id').value = CURRENT_PROJECT_ID;
+  const titleEl = document.getElementById('mem-modal-title');
+  const fileInp = document.getElementById('mem-form-filename');
+  const nameInp = document.getElementById('mem-form-title');
+  const typeSel = document.getElementById('mem-form-type');
+  const descInp = document.getElementById('mem-form-desc');
+  const contInp = document.getElementById('mem-form-content');
+
+  if (fname && CURRENT_PROJECT_DATA && CURRENT_PROJECT_DATA.files) {
+    const f = CURRENT_PROJECT_DATA.files.find(x => x.filename === fname);
+    if (f) {
+      titleEl.textContent = `Hafıza Kartı Düzenle (${fname})`;
+      fileInp.value = f.filename;
+      fileInp.readOnly = true;
+      nameInp.value = f.name;
+      typeSel.value = f.type || 'project';
+      descInp.value = f.description;
+      contInp.value = f.content;
+      openModal('memory-edit-modal');
+      return;
+    }
+  }
+
+  titleEl.textContent = 'Yeni Hafıza Kartı Ekle';
+  fileInp.value = '';
+  fileInp.readOnly = false;
+  nameInp.value = '';
+  typeSel.value = 'project';
+  descInp.value = '';
+  contInp.value = '## Amaç & Neden (Why)\n...\n\n## Nasıl Uygulanır (How to apply)\n...';
+  openModal('memory-edit-modal');
+}
+
+async function submitMemoryCard(e) {
+  e.preventDefault();
+  const pid = document.getElementById('mem-form-project-id').value;
+  let fname = document.getElementById('mem-form-filename').value.trim();
+  const title = document.getElementById('mem-form-title').value.trim();
+  const type = document.getElementById('mem-form-type').value;
+  const desc = document.getElementById('mem-form-desc').value.trim();
+  let content = document.getElementById('mem-form-content').value.trim();
+
+  if (!fname.endsWith('.md')) fname += '.md';
+
+  // Frontmatter yoksa otomatik ekle
+  if (!content.startsWith('---')) {
+    const slug = fname.replace('.md', '');
+    content = (
+      `---\n` +
+      `name: ${slug}\n` +
+      `description: ${desc || title || slug}\n` +
+      `metadata:\n` +
+      `  node_type: memory\n` +
+      `  type: ${type}\n` +
+      `  modified: ${new Date().toISOString()}\n` +
+      `---\n\n` +
+      (title ? `## ${title}\n\n` : '') +
+      content
+    );
+  }
+
+  try {
+    const res = await fetch('/__bayqus/memory-file', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        project_id: pid,
+        filename: fname,
+        content: content,
+        description: desc || title
+      })
+    });
+    const j = await res.json();
+    if (!j.ok) throw new Error(j.mesaj || 'Kaydedilemedi');
+    closeModal('memory-edit-modal');
+    selectMemoryProject(pid);
+  } catch (err) {
+    alert('Kayıt hatası: ' + err.message);
+  }
+}
+
+async function deleteMemoryCard(rawFname) {
+  const fname = decodeURIComponent(rawFname);
+  if (!confirm(`"${fname}" hafıza kartı kalıcı olarak silinecek. Emin misiniz?`)) return;
+  try {
+    const res = await fetch('/__bayqus/memory-delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        project_id: CURRENT_PROJECT_ID,
+        filename: fname
+      })
+    });
+    const j = await res.json();
+    if (!j.ok) throw new Error(j.mesaj || 'Silinemedi');
+    selectMemoryProject(CURRENT_PROJECT_ID);
+  } catch (err) {
+    alert('Silme hatası: ' + err.message);
+  }
+}
+
+async function saveMemoryIndex() {
+  const content = document.getElementById('mem-index-editor').value;
+  if (!CURRENT_PROJECT_ID) return;
+  try {
+    const res = await fetch('/__bayqus/memory-file', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        project_id: CURRENT_PROJECT_ID,
+        filename: 'MEMORY.md',
+        content: content
+      })
+    });
+    const j = await res.json();
+    if (!j.ok) throw new Error(j.mesaj || 'Kaydedilemedi');
+    alert('MEMORY.md başarıyla kaydedildi!');
+  } catch (err) {
+    alert('Hata: ' + err.message);
+  }
+}
+
+function openExtractModal() {
+  const pSel = document.getElementById('mem-extract-project');
+  const sSel = document.getElementById('mem-extract-session');
+  document.getElementById('mem-extract-status').innerHTML = '';
+  document.getElementById('mem-extract-text').value = '';
+
+  pSel.innerHTML = MEMORY_PROJECTS.map(p => `
+    <option value="${esc(p.id)}"${p.id === CURRENT_PROJECT_ID ? ' selected' : ''}>${esc(p.name)} (${esc(p.path)})</option>
+  `).join('');
+
+  const sessions = (LATEST_DATA && LATEST_DATA.oturumlar) ? LATEST_DATA.oturumlar : [];
+  sSel.innerHTML = '<option value="">— Oturum Seçin veya Aşağıya Metin Yapıştırın —</option>' + sessions.map(s => `
+    <option value="${esc(s.id)}">${esc(s.title || s.kisa)} (${esc(s.group || s.proje || '')})</option>
+  `).join('');
+
+  openModal('memory-extract-modal');
+}
+
+async function runMemoryExtract() {
+  const pid = document.getElementById('mem-extract-project').value;
+  const sid = document.getElementById('mem-extract-session').value;
+  const text = document.getElementById('mem-extract-text').value.trim();
+  const st = document.getElementById('mem-extract-status');
+  const btn = document.getElementById('btn-run-extract');
+
+  if (!sid && !text) {
+    alert('Lütfen analiz edilecek bir oturum seçin veya aşağıya metin yapıştırın.');
+    return;
+  }
+
+  btn.disabled = true;
+  st.innerHTML = '<span class="ok">⏳ Gemini Flash geçmişi analiz ediyor ve hafıza kartlarını çıkarıyor...</span>';
+
+  try {
+    const res = await fetch('/__bayqus/memory-extract', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        project_id: pid,
+        session_id: sid,
+        text: text
+      })
+    });
+    const j = await res.json();
+    if (!j.ok) throw new Error(j.mesaj || 'Hafıza çıkarılamadı');
+    st.innerHTML = `<span class="ok">✅ ${esc(j.mesaj)}</span>`;
+    setTimeout(() => {
+      closeModal('memory-extract-modal');
+      selectMemoryProject(pid);
+    }, 1200);
+  } catch (err) {
+    st.innerHTML = `<span class="bad">❌ Hata: ${esc(err.message)}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// --------------------------------------------------------------------------
+// RAG MEMORY KONTROL VE TEST FONKSİYONLARI
+// --------------------------------------------------------------------------
+let RAG_ENABLED = true;
+
+async function toggleRagMemory() {
+  RAG_ENABLED = !RAG_ENABLED;
+  try {
+    const res = await fetch('/__bayqus/memory-rag-toggle', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ enabled: RAG_ENABLED })
+    });
+    const j = await res.json();
+    updateRagUI(j.enabled);
+  } catch (e) {
+    alert('Hata: ' + e.message);
+  }
+}
+
+function updateRagUI(enabled) {
+  RAG_ENABLED = enabled;
+  const b = document.getElementById('rag-status-badge');
+  const btn = document.getElementById('btn-rag-toggle');
+  if (b) {
+    b.className = enabled ? 'badge badge-ok' : 'badge badge-dim';
+    b.textContent = enabled ? 'Aktif' : 'Devre Dışı';
+  }
+  if (btn) {
+    btn.textContent = enabled ? '🟢 RAG Açık' : '⚪ RAG Kapalı';
+  }
+}
+
+function openRagTestModal() {
+  if (!CURRENT_PROJECT_ID) {
+    alert('Lütfen önce sol listeden bir proje seçin.');
+    return;
+  }
+  document.getElementById('rag-test-project').value = CURRENT_PROJECT_ID;
+  document.getElementById('rag-test-results').innerHTML = '<div class="dim" style="text-align:center;padding:20px">Test etmek için yukarıya bir mesaj yazıp arayın.</div>';
+  openModal('memory-rag-modal');
+  setTimeout(() => document.getElementById('rag-test-query').focus(), 150);
+}
+
+async function runRagTest() {
+  const pid = document.getElementById('rag-test-project').value;
+  const query = document.getElementById('rag-test-query').value.trim();
+  const resWrap = document.getElementById('rag-test-results');
+
+  if (!query) {
+    alert('Lütfen test için bir prompt veya mesaj girin.');
+    return;
+  }
+
+  resWrap.innerHTML = '<div class="dim" style="text-align:center;padding:20px">⏳ BM25 ile taranıyor...</div>';
+
+  try {
+    const res = await fetch('/__bayqus/memory-rag-test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ project_id: pid, query: query })
+    });
+    const j = await res.json();
+    if (!j.ok) throw new Error(j.mesaj || 'Arama hatası');
+
+    if (!j.cards || !j.cards.length) {
+      resWrap.innerHTML = `
+        <div class="empty" style="padding:30px;background:var(--bg);border-radius:6px">
+          <b>🚫 Alakasız Sohbet Tespiti (0 Kart Seçildi)</b><br>
+          <span style="font-size:12px;color:var(--dim)">Bu mesaj konusuyla eşleşen herhangi bir mimari kural bulunamadı. Modele <b>0 token</b> enjekte edilir (tam tasarruf).</span>
+        </div>
+      `;
+      return;
+    }
+
+    resWrap.innerHTML = `
+      <div style="margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">
+        <b style="font-size:13px">🎯 Eşleşen Kural Kartları (${j.cards.length} adet):</b>
+        <span class="badge badge-ok">Toplam: ~${j.total_tokens_est} Token</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        ${j.cards.map(c => `
+          <div style="background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:12px">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div>
+                <span class="badge ${c.type==='feedback'?'mem-badge-feedback':'mem-badge-project'}" style="font-size:10px">${esc(c.type)}</span>
+                <b style="font-size:13px;margin-left:6px">${esc(c.title)}</b>
+                <span class="dim mono" style="font-size:11px">(${esc(c.filename)})</span>
+              </div>
+              <span class="badge badge-dim" style="font-size:10px">Alaka Skoru: ${c.rank} (~${c.tokens_est} tok)</span>
+            </div>
+            <div style="font-size:12px;color:var(--dim);margin:6px 0">${esc(c.description || 'Açıklama yok')}</div>
+            <pre style="background:var(--panel);padding:8px;border-radius:4px;font-size:11px;max-height:140px;overflow-y:auto;white-space:pre-wrap">${esc(c.body)}</pre>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  } catch (err) {
+    resWrap.innerHTML = `<div class="empty bad">Hata: ${esc(err.message)}</div>`;
   }
 }
 

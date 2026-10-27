@@ -17,14 +17,42 @@ baslasa da kalir:
   * proje kurali       — o klasorde acilan HER sohbet icin. Kalicidir.
 Oncelik: oturum > proje > model eslesmesi.
 """
+import glob
 import json
 import os
 import threading
 import time
+from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, "logs", "sessions.json")
 PROJECTS = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+METRICS = os.path.join(HERE, "logs", "metrics.jsonl")
+
+
+def get_claude_base_dirs():
+    """Claude Desktop ve Claude 3p icin veri dizinlerini oncelik sirasiyla doner."""
+    dirs = []
+    # 1. Oncelik: Claude-3p (Inference Gateway kullanan aktif profil)
+    c3p = os.path.expandvars(r"%LOCALAPPDATA%\Claude-3p")
+    if os.path.isdir(c3p):
+        dirs.append(c3p)
+
+    # 2. Standart Claude ve diger instance dizinleri
+    candidates = [
+        os.path.expandvars(r"%APPDATA%\Claude"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Claude"),
+        os.path.expandvars(r"%APPDATA%\Claude-Instance2"),
+        os.path.expandvars(r"%APPDATA%\Claude-Instance3"),
+        os.path.expandvars(r"%APPDATA%\Claude-Kisisel"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Claude-Individual"),
+    ]
+    for c in candidates:
+        if os.path.isdir(c) and c not in dirs:
+            dirs.append(c)
+    return dirs
+
+
 CLAUDE_SESSIONS_DIR = os.path.expandvars(r"%APPDATA%\Claude\claude-code-sessions")
 
 _LOCK = threading.Lock()
@@ -33,19 +61,73 @@ _PROJ_PINS = {}           # proje yolu (kucuk harf) -> rota adi
 _GROUP_PINS = {}          # grup adi -> rota adi
 _SUBAGENT_PINS = {}       # session_id -> subagent rota adi
 _GROUP_SUBAGENT_PINS = {} # grup adi -> subagent rota adi
+_DISABLED_PRUNE_SESSIONS = set() # budamasi ozel olarak kapatilmis oturum kimlikleri
 _SEEN = {}                # session_id -> {ilk, son, istek, modeller{}, rota, proje, agent_id, parent}
 _PROJECT = {}             # session_id -> proje etiketi ("" = bulunamadi)
 _AGENT_PARENT = {}        # agent_id / subagent_sid -> parent_session_id
 _AGENT_META = {}          # agent_id -> metadata (dict)
 _CLAUDE_META_CACHE = {}
 _CLAUDE_META_TIME = 0
+_KNOWN_GROUPS = []
 
 
 # --------------------------------------------------------------------------
-# kalici durum
+# kalici durum & metrics gecmisi
 # --------------------------------------------------------------------------
+def prime_seen_from_metrics(limit=5000):
+    """metrics.jsonl dosyasindan gecmis oturum trafik istatistiklerini yukler."""
+    if not os.path.exists(METRICS):
+        return
+    try:
+        with open(METRICS, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        with _LOCK:
+            for line in lines[-limit:]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    sid = rec.get("session")
+                    agent_id = rec.get("agent")
+                    target = sid or agent_id
+                    if not target:
+                        continue
+                    model = rec.get("model")
+                    route = rec.get("route")
+                    ts_str = rec.get("ts")
+
+                    try:
+                        ts = datetime.fromisoformat(ts_str).timestamp() if ts_str else time.time()
+                    except Exception:
+                        ts = time.time()
+
+                    if sid and agent_id:
+                        _AGENT_PARENT[agent_id] = sid
+                    parent = _AGENT_PARENT.get(agent_id or sid)
+
+                    st = _SEEN.setdefault(target, {
+                        "ilk": ts, "son": ts, "istek": 0,
+                        "modeller": {}, "rota": route,
+                        "agent_id": agent_id, "parent": parent
+                    })
+                    st["istek"] += 1
+                    if ts >= st.get("son", 0):
+                        st["son"] = ts
+                        if route:
+                            st["rota"] = route
+                    if ts <= st.get("ilk", ts):
+                        st["ilk"] = ts
+                    if model:
+                        st["modeller"][model] = st["modeller"].get(model, 0) + 1
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"[sessions] metrics prime hatasi: {e}")
+
+
 def load():
-    global _PINS, _PROJ_PINS, _GROUP_PINS, _SUBAGENT_PINS, _GROUP_SUBAGENT_PINS
+    global _PINS, _PROJ_PINS, _GROUP_PINS, _SUBAGENT_PINS, _GROUP_SUBAGENT_PINS, _DISABLED_PRUNE_SESSIONS
     try:
         with open(STATE, encoding="utf-8") as f:
             d = json.load(f)
@@ -55,13 +137,21 @@ def load():
         _GROUP_PINS = {str(k): str(v) for k, v in (d.get("groups") or {}).items() if v}
         _SUBAGENT_PINS = {str(k): str(v) for k, v in (d.get("subagent_pins") or {}).items() if v}
         _GROUP_SUBAGENT_PINS = {str(k): str(v) for k, v in (d.get("group_subagents") or {}).items() if v}
+        _DISABLED_PRUNE_SESSIONS = set(d.get("disabled_prune_sessions") or [])
     except FileNotFoundError:
         _PINS, _PROJ_PINS, _GROUP_PINS, _SUBAGENT_PINS, _GROUP_SUBAGENT_PINS = {}, {}, {}, {}, {}
+        _DISABLED_PRUNE_SESSIONS = set()
     except Exception as e:
         print(f"!!! sessions.json okunamadi ({type(e).__name__}: {e}) — "
               f"sabitlemeler bos baslatildi")
         _PINS, _PROJ_PINS, _GROUP_PINS, _SUBAGENT_PINS, _GROUP_SUBAGENT_PINS = {}, {}, {}, {}, {}
+        _DISABLED_PRUNE_SESSIONS = set()
+    prime_seen_from_metrics()
     return _PINS, _PROJ_PINS
+
+
+# Modul yuklendiginde kalici verileri otomatik oku
+load()
 
 
 def _save_locked():
@@ -74,8 +164,61 @@ def _save_locked():
             "groups": _GROUP_PINS,
             "subagent_pins": _SUBAGENT_PINS,
             "group_subagents": _GROUP_SUBAGENT_PINS,
+            "disabled_prune_sessions": list(_DISABLED_PRUNE_SESSIONS),
         }, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE)
+
+
+def is_prune_disabled(sid, agent_id=None):
+    """Oturum veya alt-ajan icin budama kapatilmis mi?"""
+    if not sid and not agent_id:
+        return False
+    with _LOCK:
+        if sid in _DISABLED_PRUNE_SESSIONS:
+            return True
+        if agent_id and agent_id in _DISABLED_PRUNE_SESSIONS:
+            return True
+        parent = _AGENT_PARENT.get(agent_id or sid)
+        if parent and parent in _DISABLED_PRUNE_SESSIONS:
+            return True
+        meta = _CLAUDE_META_CACHE.get(sid)
+        if meta:
+            if meta.get("cli_id") in _DISABLED_PRUNE_SESSIONS or meta.get("local_id") in _DISABLED_PRUNE_SESSIONS:
+                return True
+    return False
+
+
+def set_session_prune(sid, enabled: bool):
+    """Belirli bir oturum icin budamayi acar veya kapatir."""
+    sid = (sid or "").strip()
+    if not sid:
+        return False, "oturum kimligi bos"
+    with _LOCK:
+        related_ids = {sid}
+        meta = _CLAUDE_META_CACHE.get(sid)
+        if meta:
+            if meta.get("cli_id"):
+                related_ids.add(meta["cli_id"])
+            if meta.get("local_id"):
+                related_ids.add(meta["local_id"])
+
+        if not enabled:
+            _DISABLED_PRUNE_SESSIONS.update(related_ids)
+            msg = f"{sid[:8]} icin budama kapatildi"
+        else:
+            for rid in related_ids:
+                _DISABLED_PRUNE_SESSIONS.discard(rid)
+            msg = f"{sid[:8]} icin budama acildi"
+        try:
+            _save_locked()
+        except Exception as e:
+            return True, f"{msg} (DISKE YAZILAMADI: {type(e).__name__}: {e})"
+    return True, msg
+
+
+def disabled_prune_sessions():
+    with _LOCK:
+        return list(_DISABLED_PRUNE_SESSIONS)
 
 
 # --------------------------------------------------------------------------
@@ -229,51 +372,91 @@ def note(sid, model=None, route=None, agent_id=None):
             st["rota"] = route
 
 
+def get_known_groups():
+    load_claude_desktop_metadata()
+    return list(_KNOWN_GROUPS)
+
+
 def load_claude_desktop_metadata():
-    """Claude Desktop'un %APPDATA%/Claude/claude-code-sessions altindaki oturumlarini okur ve onbellege alir."""
-    global _CLAUDE_META_CACHE, _CLAUDE_META_TIME
+    """Claude Desktop ve Claude 3p oturumlarini ve gruplarini okur ve onbellege alir."""
+    global _CLAUDE_META_CACHE, _CLAUDE_META_TIME, _KNOWN_GROUPS
     now = time.time()
     if _CLAUDE_META_CACHE and (now - _CLAUDE_META_TIME < 3):
         return dict(_CLAUDE_META_CACHE)
 
     res = {}
     known_groups = []
-    if os.path.isdir(CLAUDE_SESSIONS_DIR):
-        import glob
-        pattern = os.path.join(CLAUDE_SESSIONS_DIR, "**", "local_*.json")
-        for f in glob.glob(pattern, recursive=True):
+    assignments = {}  # local_id -> group_name
+
+    for base in get_claude_base_dirs():
+        # A) claude_desktop_config.json'dan gruplari ve atamalari oku
+        cfg_file = os.path.join(base, "claude_desktop_config.json")
+        if os.path.exists(cfg_file):
             try:
-                with open(f, "r", encoding="utf-8") as fp:
-                    d = json.load(fp)
-                cid = d.get("cliSessionId")
-                if not cid:
-                    continue
-                title = (d.get("title") or "").strip() or "İsimsiz Sohbet"
-                matched_g = None
-                for kg in known_groups:
-                    if title.lower().startswith(kg.lower()):
-                        matched_g = kg
-                        break
-                if not matched_g:
-                    parts = title.split()
-                    matched_g = parts[0] if parts else "Genel"
-                
-                res[cid] = {
-                    "local_id": d.get("sessionId"),
-                    "cli_id": cid,
-                    "title": title,
-                    "group": matched_g,
-                    "cwd": d.get("cwd") or "",
-                    "origin_cwd": d.get("originCwd") or "",
-                    "archived": bool(d.get("isArchived", False)),
-                    "last_focused": d.get("lastFocusedAt", 0)
-                }
+                with open(cfg_file, "r", encoding="utf-8-sig") as fp:
+                    cfg = json.load(fp)
+                scopes = cfg.get("preferences", {}).get("epitaxyPrefs", {}).get("dframe-group-scopes", {})
+                for sc_id, sc in scopes.items():
+                    for g in sc.get("groups", []):
+                        gname = g.get("name")
+                        if gname and gname not in known_groups:
+                            known_groups.append(gname)
+                    for code_k, gid in sc.get("assignments", {}).items():
+                        lid = code_k.replace("code:", "")
+                        for g in sc.get("groups", []):
+                            if g.get("id") == gid:
+                                assignments[lid] = g.get("name")
+                                break
             except Exception:
                 pass
+
+        # B) claude-code-sessions altindaki tum oturum dosyalarini tara
+        sess_dir = os.path.join(base, "claude-code-sessions")
+        if os.path.isdir(sess_dir):
+            for f in glob.glob(os.path.join(sess_dir, "**", "local_*.json"), recursive=True):
+                try:
+                    with open(f, "r", encoding="utf-8-sig") as fp:
+                        d = json.load(fp)
+                    cid = d.get("cliSessionId")
+                    lid = d.get("sessionId")
+                    if not cid and not lid:
+                        continue
+                    title = (d.get("title") or "").strip() or "İsimsiz Sohbet"
+
+                    # 1. Atanmis grup, 2. Basliktan grup tespiti, 3. Genel
+                    matched_g = assignments.get(lid)
+                    if not matched_g:
+                        for kg in known_groups:
+                            if title.lower().startswith(kg.lower()):
+                                matched_g = kg
+                                break
+                    if not matched_g:
+                        matched_g = "Genel"
+
+                    entry = {
+                        "local_id": lid,
+                        "cli_id": cid or lid,
+                        "title": title,
+                        "group": matched_g,
+                        "cwd": d.get("cwd") or "",
+                        "origin_cwd": d.get("originCwd") or "",
+                        "archived": bool(d.get("isArchived", False)),
+                        "last_focused": d.get("lastFocusedAt", 0) or d.get("lastActivityAt", 0) or d.get("createdAt", 0),
+                        "model": d.get("model") or ""
+                    }
+
+                    # Hem cliSessionId hem de local sessionId ile indeksle
+                    if cid and cid not in res:
+                        res[cid] = entry
+                    if lid and lid not in res:
+                        res[lid] = entry
+                except Exception:
+                    pass
 
     with _LOCK:
         _CLAUDE_META_CACHE = res
         _CLAUDE_META_TIME = now
+        _KNOWN_GROUPS = known_groups
     return dict(res)
 
 
@@ -472,18 +655,28 @@ def pin(sid, route_name):
 
 
 def get_claude_desktop_groups_data(default_route="gateway"):
-    """Claude Desktop sol panelindeki gruplar ve sohbetleri hiyerarsik olarak doner."""
+    """Claude Desktop / 3p sol panelindeki gruplar ve sohbetleri hiyerarsik olarak doner."""
     meta = load_claude_desktop_metadata()
+    known_groups = get_known_groups()
+
     grouped = {}
+    for gname in known_groups:
+        grouped[gname] = []
+
     for cid, sinfo in meta.items():
-        if sinfo.get("archived"):
+        if cid.startswith("local_") or sinfo.get("archived"):
             continue
         gname = sinfo.get("group") or "Genel"
         grouped.setdefault(gname, []).append(sinfo)
 
     out = []
-    for gname in sorted(grouped.keys()):
-        slist = grouped[gname]
+    ordered_gnames = list(known_groups)
+    for gn in sorted(grouped.keys()):
+        if gn not in ordered_gnames:
+            ordered_gnames.append(gn)
+
+    for gname in ordered_gnames:
+        slist = grouped.get(gname, [])
         g_sabit = _GROUP_PINS.get(gname)
         g_sub_sabit = _GROUP_SUBAGENT_PINS.get(gname)
         g_etkin = g_sabit or default_route
@@ -526,6 +719,7 @@ def get_claude_desktop_groups_data(default_route="gateway"):
                 "subagent_kaynak": sub_kaynak,
                 "istek": seen_info.get("istek", 0),
                 "yas_sn": yas_sn,
+                "prune_disabled": is_prune_disabled(cid),
             })
 
         out.append({
@@ -548,11 +742,13 @@ def snapshot(limit=40):
     with _LOCK:
         items = list(_SEEN.items())
     out = []
+    seen_ids = set()
     for sid, st in items:
         # Alt-ajanlari filtrele (gecici olduklari icin ana listede yer almazlar)
         if st.get("agent_id") or st.get("parent"):
             continue
 
+        seen_ids.add(sid)
         mods = sorted(st["modeller"].items(), key=lambda kv: -kv[1])
         s_meta = meta.get(sid, {})
         title = s_meta.get("title") or sid[:8]
@@ -565,7 +761,7 @@ def snapshot(limit=40):
             "kisa": sid[:8],
             "title": title,
             "group": group,
-            "proje": s_meta.get("origin_cwd") or project_for(sid),
+            "proje": s_meta.get("origin_cwd") or s_meta.get("cwd") or project_for(sid),
             "istek": st["istek"],
             "modeller": [m for m, _ in mods[:3]],
             "rota": st["rota"],
@@ -574,18 +770,34 @@ def snapshot(limit=40):
             "kaynak": kaynak,
             "subagent_sabit": sub_sabit,
             "yas_sn": int(time.time() - st["son"]),
+            "prune_disabled": is_prune_disabled(sid),
         })
-    out.sort(key=lambda r: (r["yas_sn"] if r["yas_sn"] is not None else 999999))
-    bilinen = {r["id"] for r in out}
-    for sid, rota in _PINS.items():
-        if sid not in bilinen:
-            s_meta = meta.get(sid, {})
-            out.append({"id": sid, "kisa": sid[:8],
-                        "title": s_meta.get("title") or sid[:8],
-                        "group": s_meta.get("group") or "",
-                        "proje": s_meta.get("origin_cwd") or project_for(sid),
-                        "istek": 0, "modeller": [], "rota": None,
-                        "sabit": rota, "etkin": rota, "kaynak": "oturum",
-                        "subagent_sabit": _SUBAGENT_PINS.get(sid),
-                        "yas_sn": None})
+
+    # Claude Desktop / 3p'deki aktif arsivlenmemis sohbetleri de listeye ekle
+    for cid, sinfo in meta.items():
+        if cid in seen_ids or cid.startswith("local_") or sinfo.get("archived"):
+            continue
+        seen_ids.add(cid)
+        sabit, kaynak = pinned(cid)
+        sub_sabit = _SUBAGENT_PINS.get(cid)
+        lf = sinfo.get("last_focused", 0)
+        yas_sn = int(time.time() - (lf / 1000.0)) if lf > 0 else None
+        out.append({
+            "id": cid,
+            "kisa": cid[:8],
+            "title": sinfo["title"],
+            "group": sinfo["group"],
+            "proje": sinfo.get("origin_cwd") or sinfo.get("cwd") or project_for(cid),
+            "istek": 0,
+            "modeller": [sinfo["model"]] if sinfo.get("model") else [],
+            "rota": None,
+            "sabit": _PINS.get(cid),
+            "etkin": sabit or "gateway",
+            "kaynak": kaynak or "varsayılan",
+            "subagent_sabit": sub_sabit,
+            "yas_sn": yas_sn,
+            "prune_disabled": is_prune_disabled(cid),
+        })
+
+    out.sort(key=lambda r: (r["yas_sn"] if r["yas_sn"] is not None else 99999999))
     return out[:limit]

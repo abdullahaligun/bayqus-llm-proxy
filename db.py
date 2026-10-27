@@ -87,11 +87,25 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS ix_rh_session ON request_history(session_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_rh_id_desc ON request_history(id DESC);")
 
+    # 5. Oturum RAG Hafıza Haritası (Session-Sticky User Message Injections)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS session_rag_injections (
+            session_id TEXT NOT NULL,
+            msg_hash   TEXT NOT NULL,
+            rag_block  TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, msg_hash)
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_sri_session ON session_rag_injections(session_id);")
+
     # Varsayilan Ayarlar
     defaults = {
         "enable_pruning": "true",
-        "block_size": "32",
-        "keep_recent_messages": "40",
+        "block_size": "24",
+        "keep_recent_messages": "144",
+        "cold_buffer": "36",
+        "ttl_seconds": "14400",
         "enable_ai_summarizer": "true",
         "summarizer_mode": "hybrid",  # hybrid | agent_only | api_only | deterministic
         "preferred_gemini_model": "round-robin",
@@ -456,6 +470,7 @@ def clear_cache():
         cur = conn.cursor()
         cur.execute("DELETE FROM pruned_prefix_cache")
         cur.execute("DELETE FROM session_blocks")
+        cur.execute("DELETE FROM session_rag_injections")
         conn.commit()
         cur.execute("VACUUM")
         conn.commit()
@@ -463,6 +478,56 @@ def clear_cache():
         return True
     except Exception as e:
         print(f"[!] clear_cache hatasi: {e}")
+        return False
+
+
+def save_rag_injection(session_id: str, msg_hash: str, rag_block: str):
+    """Kullanici mesajina yapistirilan RAG blogunu oturum icin kaydeder."""
+    if not session_id or not msg_hash or not rag_block:
+        return
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        now = datetime.utcnow().isoformat()
+        cur.execute("""
+            INSERT OR REPLACE INTO session_rag_injections (session_id, msg_hash, rag_block, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (session_id, msg_hash, rag_block, now))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[!] save_rag_injection hatasi: {e}")
+
+
+def get_session_rag_injections(session_id: str) -> dict:
+    """Oturuma ait kaydedilmis tum RAG enjeksiyonlarini msg_hash -> rag_block sozlugu olarak doner."""
+    if not session_id:
+        return {}
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT msg_hash, rag_block FROM session_rag_injections WHERE session_id = ?", (session_id,))
+        rows = cur.fetchall()
+        conn.close()
+        return {r["msg_hash"]: r["rag_block"] for r in rows}
+    except Exception as e:
+        print(f"[!] get_session_rag_injections hatasi: {e}")
+        return {}
+
+
+def clear_session_rag_injections(session_id: str = None):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        if session_id:
+            cur.execute("DELETE FROM session_rag_injections WHERE session_id = ?", (session_id,))
+        else:
+            cur.execute("DELETE FROM session_rag_injections")
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[!] clear_session_rag_injections hatasi: {e}")
         return False
 
 

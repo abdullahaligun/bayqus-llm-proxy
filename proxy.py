@@ -44,11 +44,14 @@ import agent_bridge
 import dashboard
 import db
 import mcp_manager
+import memory_manager
+import memory_rag
 import mocks
 import pruner
 import router
 import sessions
 import stats
+import task_detector
 import tiktoken
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -342,7 +345,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         # Pano yalnizca yerel; upstream'e hic gitmez.
-        if self.path.startswith("/__bayqus"):
+        if self.path in ("/", "") or self.path.startswith("/__bayqus"):
             if self.path.startswith("/__bayqus/data"):
                 cfg = router.get_config()
                 try:
@@ -429,6 +432,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 search = qs.get("q", [None])[0]
                 hist = db.get_history(limit=limit, offset=offset, session_id=session_id, search=search)
                 self._serve(json.dumps(hist, ensure_ascii=False).encode("utf-8"),
+                            "application/json; charset=utf-8")
+                return
+            elif self.path.startswith("/__bayqus/memories"):
+                projs = memory_manager.list_projects()
+                self._serve(json.dumps({"ok": True, "projects": projs}, ensure_ascii=False).encode("utf-8"),
+                            "application/json; charset=utf-8")
+                return
+            elif self.path.startswith("/__bayqus/memory-project"):
+                parsed_url = urllib.parse.urlparse(self.path)
+                qs = urllib.parse.parse_qs(parsed_url.query)
+                pid = qs.get("id", [""])[0]
+                data = memory_manager.get_project_memory(pid)
+                self._serve(json.dumps({"ok": True, "data": data}, ensure_ascii=False).encode("utf-8"),
                             "application/json; charset=utf-8")
                 return
             else:
@@ -533,6 +549,98 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ok, mesaj = sessions.pin_subagent(sid, rota)
             print(f"[pano] sohbet alt-ajan kurali: {mesaj}")
             self._serve(json.dumps({"ok": ok, "mesaj": mesaj}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        # Oturum bazli budama acma / kapatma
+        if self.path.startswith("/__bayqus/session-prune"):
+            sid = str(req.get("session") or "")
+            prune_enabled = bool(req.get("enabled", True))
+            ok, mesaj = sessions.set_session_prune(sid, prune_enabled)
+            print(f"[pano] oturum budama: {mesaj}")
+            self._serve(json.dumps({"ok": ok, "mesaj": mesaj}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        # Hafıza Dosyası Kaydetme / Güncelleme
+        if self.path.startswith("/__bayqus/memory-file"):
+            pid = str(req.get("project_id") or "")
+            fname = str(req.get("filename") or "")
+            content = str(req.get("content") or "")
+            desc = str(req.get("description") or "")
+            ok, mesaj = memory_manager.save_memory_file(pid, fname, content, description=desc)
+            self._serve(json.dumps({"ok": ok, "mesaj": mesaj}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        # Hafıza Dosyası Silme
+        if self.path.startswith("/__bayqus/memory-delete"):
+            pid = str(req.get("project_id") or "")
+            fname = str(req.get("filename") or "")
+            ok, mesaj = memory_manager.delete_memory_file(pid, fname)
+            self._serve(json.dumps({"ok": ok, "mesaj": mesaj}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        # AI ile Hafıza / Kural Çıkarma
+        if self.path.startswith("/__bayqus/memory-extract"):
+            pid = str(req.get("project_id") or "")
+            sid = str(req.get("session_id") or "")
+            text = str(req.get("text") or "")
+            if sid and not text:
+                try:
+                    conn = db.get_conn()
+                    cur = conn.cursor()
+                    cur.execute("SELECT messages_json, response_json FROM request_history WHERE session_id = ? ORDER BY id DESC LIMIT 6", (sid,))
+                    rows = cur.fetchall()
+                    conn.close()
+                    parts = []
+                    for r in reversed(rows):
+                        if r["messages_json"]:
+                            try:
+                                ms = json.loads(r["messages_json"])
+                                for m in ms[-10:]:
+                                    c = m.get("content")
+                                    if isinstance(c, list):
+                                        c = " ".join([b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"])
+                                    parts.append(f"{m.get('role')}: {str(c)[:500]}")
+                            except Exception: pass
+                        if r["response_json"]:
+                            try:
+                                resp = json.loads(r["response_json"])
+                                parts.append(f"assistant: {str(resp)[:500]}")
+                            except Exception: pass
+                    text = "\n".join(parts)
+                except Exception:
+                    pass
+
+            if not text:
+                self._fail(400, "Analiz edilecek oturum geçmişi veya metin bulunamadı")
+                return
+
+            ok, mesaj = memory_manager.extract_memory_with_ai(text, pid)
+            self._serve(json.dumps({"ok": ok, "mesaj": mesaj}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        # RAG Hafıza Durumu ve Açma / Kapatma (Toggle)
+        if self.path.startswith("/__bayqus/memory-rag-toggle"):
+            enabled = bool(req.get("enabled", True))
+            db.set_setting("enable_rag_memory", "true" if enabled else "false")
+            durum = "Aktif" if enabled else "Devre Dışı"
+            print(f"[pano] RAG hafıza modu: {durum}")
+            self._serve(json.dumps({"ok": True, "enabled": enabled, "mesaj": f"Dinamik RAG Hafıza: {durum}"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        # RAG Canlı Arama Simülasyonu / Testi
+        if self.path.startswith("/__bayqus/memory-rag-test"):
+            pid = str(req.get("project_id") or "")
+            query = str(req.get("query") or "")
+            cards = memory_rag.search_relevant_memories(pid, query, max_cards=3)
+            tok_est = sum(c["tokens_est"] for c in cards)
+            self._serve(json.dumps({
+                "ok": True,
+                "project_id": pid,
+                "query": query,
+                "cards_count": len(cards),
+                "total_tokens_est": tok_est,
+                "cards": cards
+            }, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             return
 
         # MCP Sunucu Acma / Kapatma (Toggle)
@@ -705,6 +813,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None, None
         if "count_tokens" in self.path:
             return None, None
+        if sessions.is_prune_disabled(session_id):
+            return None, {"applied": False, "reason": "oturum bazli budama devre disi (kullanici ayari)"}
         try:
             plan = pruner.plan(parsed, session_id)
         except Exception as e:
@@ -742,6 +852,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.rfile.read(int(self.headers["Content-Length"]))
 
         req_info, parsed = analyze_request(body)
+
+        # Sentetik <total_tokens> pinglemesini temizle ve rolleri guvenle birlestir
+        token_pings_stripped = 0
+        if parsed and isinstance(parsed.get("messages"), list):
+            raw_msg_count = len(parsed["messages"])
+            cleaned_msgs = pruner.strip_synthetic_token_pings(parsed["messages"])
+            cleaned_msgs = pruner.ensure_alternating_roles(cleaned_msgs)
+            if len(cleaned_msgs) != raw_msg_count:
+                token_pings_stripped = raw_msg_count - len(cleaned_msgs)
+                parsed["messages"] = cleaned_msgs
+                body = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
+                req_info["messages"] = len(cleaned_msgs)
+                req_info["body_bytes"] = len(body)
+
         # Claude Code her istege bunu koyar ve sohbet boyunca sabittir;
         # model degisse bile degismez. Oturum bazli yonlendirmenin dayanagi.
         sid = self.headers.get("x-claude-code-session-id") or ""
@@ -753,6 +877,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         print(f"           model={req_info['model']}  "
               f"mesaj={req_info['messages']}  arac={req_info['tools']}  "
               f"govde={n(req_info['body_bytes'])}B  stream={req_info['stream']}")
+        if token_pings_stripped > 0:
+            print(f"           ⚡ SENTETIK TOKEN TEMIZLIGI: {token_pings_stripped} sentetik ping elendi -> {req_info['messages']} gercek mesaj")
         if sid or agent_id:
             proje = sessions.project_for(sid, agent_id=agent_id)
             print(f"           oturum={(sid or agent_id)[:8]}"
@@ -810,16 +936,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if rw:
             body = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
             print(f"           model yeniden yazildi: {rw[0]} -> {rw[1]}")
-            req_info["model_sent"] = rw[1]
+        # Dinamik RAG Hafıza Enjeksiyonu (Sohbet akışına göre hedeflenmiş kural enjeksiyonu)
+        if parsed and method == "POST" and self.path.startswith("/v1/messages") and "count_tokens" not in self.path:
+            parsed, rag_injected, rag_info = memory_rag.maybe_inject_rag(parsed, sid, agent_id=agent_id)
+            if rag_injected:
+                body = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
+                print(f"           🧠 RAG HAFIZA: {rag_info}")
+
+        # Görev Geçişi Tespiti (Doğruluk Test Modu)
+        task_info = None
+        task_badge = ""
+        if parsed and method == "POST" and self.path.startswith("/v1/messages") and "count_tokens" not in self.path:
+            msgs = parsed.get("messages") or []
+            task_info = task_detector.detect_task_transition(msgs, session_id=sid)
+            if task_info.get("is_transition"):
+                task_badge = task_detector.format_chat_badge(task_info)
+                conf_pct = int(task_info.get("confidence", 0.9) * 100)
+                print(f"           🎯 GÖREV GEÇİŞİ #{task_info['task_id']}: {task_info['task_name']} (Güven: %{conf_pct})")
+                print(f"              Gerekçe: {task_info['reason']}")
+
+        # Dinamik sistem promptu ve onbellek optimizasyonu (her istekte)
+        if parsed and method == "POST" and self.path.startswith("/v1/messages") and "count_tokens" not in self.path:
+            parsed = pruner.sanitize_system_prompt(parsed)
+            body = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
 
         orig_bytes = len(body) if body else 0
         new_body, plan = self._maybe_prune(method, parsed, route, sid)
         planned_bytes = len(plan["body"]) if (plan and plan.get("applied")) else orig_bytes
         if new_body is not None:
             body = new_body
-        elif parsed and "anthropic.com" not in upstream:
-            pruner.normalize_cache_controls(parsed)
-            body = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
+        else:
+            if parsed and method == "POST" and self.path.startswith("/v1/messages") and "count_tokens" not in self.path:
+                parsed = pruner.apply_sliding_cache_markers(parsed)
+                pruner.normalize_cache_controls(parsed)
+                parsed = pruner.sanitize_cache_control_budget(parsed, max_allowed=4)
+                body = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
         sent_bytes = len(body) if body else 0
         req_info["route"] = route["name"]
         req_info["upstream"] = upstream
@@ -912,10 +1063,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.end_headers()
                     scanner = UsageScanner()
                     total = 0
+                    badge_injected = False
                     while True:
                         chunk = r.read(4096)
                         if not chunk:
                             break
+                        if task_badge and not badge_injected:
+                            if b'"text_delta"' in chunk:
+                                try:
+                                    chunk_str = chunk.decode("utf-8", "replace")
+                                    lines = chunk_str.split("\n")
+                                    new_lines = []
+                                    for line in lines:
+                                        if not badge_injected and line.startswith("data: ") and '"text_delta"' in line:
+                                            payload_obj = json.loads(line[6:].strip())
+                                            if payload_obj.get("type") == "content_block_delta":
+                                                delta_obj = payload_obj.get("delta", {})
+                                                if delta_obj.get("type") == "text_delta":
+                                                    delta_obj["text"] = task_badge + delta_obj.get("text", "")
+                                                    line = "data: " + json.dumps(payload_obj, ensure_ascii=False)
+                                                    badge_injected = True
+                                        new_lines.append(line)
+                                    if badge_injected:
+                                        chunk = "\n".join(new_lines).encode("utf-8")
+                                except Exception:
+                                    pass
                         total += len(chunk)
                         # once istemciye akit (gecikme eklemeyelim)
                         self.wfile.write(b"%X\r\n" % len(chunk))
@@ -930,6 +1102,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     resp_content = scanner.get_content()
                 else:
                     data = r.read()
+                    if task_badge:
+                        try:
+                            o = json.loads(data)
+                            content = (o.get("message") or {}).get("content") or o.get("content")
+                            if isinstance(content, list):
+                                for b in content:
+                                    if isinstance(b, dict) and b.get("type") == "text":
+                                        b["text"] = task_badge + b.get("text", "")
+                                        data = json.dumps(o, ensure_ascii=False).encode("utf-8")
+                                        break
+                        except Exception:
+                            pass
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
                     self.wfile.write(data)
@@ -1087,27 +1271,33 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def auto_wrap_claude_code():
     """Claude Desktop veya Claude Code guncellendiginde yeni olusan versiyonlari otomatik sarar."""
-    base = os.path.expandvars(r"%APPDATA%\Claude\claude-code")
+    bases = [
+        os.path.expandvars(r"%LOCALAPPDATA%\Claude-3p\claude-code"),
+        os.path.expandvars(r"%APPDATA%\Claude\claude-code"),
+    ]
     wrapper_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wrapper", "wrapper.exe")
-    if not os.path.exists(wrapper_bin) or not os.path.isdir(base):
+    if not os.path.exists(wrapper_bin):
         return
-    try:
-        for item in os.listdir(base):
-            vdir = os.path.join(base, item)
-            if not os.path.isdir(vdir):
-                continue
-            c_exe = os.path.join(vdir, "claude.exe")
-            c_real = os.path.join(vdir, "claude_real.exe")
-            if os.path.exists(c_exe) and not os.path.exists(c_real):
-                try:
-                    if os.path.getsize(c_exe) > 50 * 1024 * 1024:
-                        os.rename(c_exe, c_real)
-                        shutil.copy2(wrapper_bin, c_exe)
-                        print(f"[auto-wrap] {item}/claude.exe sarildi (wrapper kuruldu)")
-                except Exception as e:
-                    pass
-    except Exception:
-        pass
+    for base in bases:
+        if not os.path.isdir(base):
+            continue
+        try:
+            for item in os.listdir(base):
+                vdir = os.path.join(base, item)
+                if not os.path.isdir(vdir):
+                    continue
+                c_exe = os.path.join(vdir, "claude.exe")
+                c_real = os.path.join(vdir, "claude_real.exe")
+                if os.path.exists(c_exe) and not os.path.exists(c_real):
+                    try:
+                        if os.path.getsize(c_exe) > 50 * 1024 * 1024:
+                            os.rename(c_exe, c_real)
+                            shutil.copy2(wrapper_bin, c_exe)
+                            print(f"[auto-wrap] {item}/claude.exe sarildi (wrapper kuruldu)")
+                    except Exception as e:
+                        pass
+        except Exception:
+            pass
 
 
 def _wrap_watcher_loop():

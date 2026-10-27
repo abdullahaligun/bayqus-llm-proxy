@@ -18,8 +18,31 @@ import threading
 import time
 
 CLAUDE_JSON_PATH = os.path.expanduser("~/.claude.json")
-CLAUDE_DESKTOP_CONFIG = os.path.expandvars(r"%APPDATA%\Claude\claude_desktop_config.json")
-CLAUDE_SESSIONS_DIR = os.path.expandvars(r"%APPDATA%\Claude\claude-code-sessions")
+
+
+def get_claude_desktop_configs():
+    cands = [
+        os.path.expandvars(r"%LOCALAPPDATA%\Claude-3p\claude_desktop_config.json"),
+        os.path.expandvars(r"%APPDATA%\Claude\claude_desktop_config.json"),
+    ]
+    return [c for c in cands if os.path.exists(c)]
+
+
+def get_claude_session_dirs():
+    cands = [
+        os.path.expandvars(r"%LOCALAPPDATA%\Claude-3p\claude-code-sessions"),
+        os.path.expandvars(r"%APPDATA%\Claude\claude-code-sessions"),
+    ]
+    return [c for c in cands if os.path.isdir(c)]
+
+
+CLAUDE_DESKTOP_CONFIG = os.path.expandvars(r"%LOCALAPPDATA%\Claude-3p\claude_desktop_config.json")
+if not os.path.exists(CLAUDE_DESKTOP_CONFIG):
+    CLAUDE_DESKTOP_CONFIG = os.path.expandvars(r"%APPDATA%\Claude\claude_desktop_config.json")
+
+CLAUDE_SESSIONS_DIR = os.path.expandvars(r"%LOCALAPPDATA%\Claude-3p\claude-code-sessions")
+if not os.path.isdir(CLAUDE_SESSIONS_DIR):
+    CLAUDE_SESSIONS_DIR = os.path.expandvars(r"%APPDATA%\Claude\claude-code-sessions")
 
 _LOCK = threading.Lock()
 

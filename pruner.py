@@ -19,17 +19,18 @@ import copy
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 
 import agent_bridge
 import db
 
-BLOCK = int(os.environ.get("BAYQUS_BLOCK", "32"))
-KEEP_RECENT = int(os.environ.get("BAYQUS_KEEP_RECENT", "40"))
-COLD_BUFFER = int(os.environ.get("BAYQUS_COLD_BUFFER", "12"))
-KEEP_RECENT_COLD = int(os.environ.get("BAYQUS_KEEP_RECENT_COLD", "12"))
-TTL = int(os.environ.get("BAYQUS_TTL", "300"))
+BLOCK = int(os.environ.get("BAYQUS_BLOCK", "24"))
+KEEP_RECENT = int(os.environ.get("BAYQUS_KEEP_RECENT", "144"))
+COLD_BUFFER = int(os.environ.get("BAYQUS_COLD_BUFFER", "36"))
+KEEP_RECENT_COLD = int(os.environ.get("BAYQUS_KEEP_RECENT_COLD", "36"))
+TTL = int(os.environ.get("BAYQUS_TTL", "14400"))
 MIN_MESSAGES = int(os.environ.get("BAYQUS_MIN_MESSAGES", "12"))
 
 TR_THRESHOLD = int(os.environ.get("BAYQUS_TR_THRESHOLD", "500"))
@@ -134,6 +135,92 @@ def ensure_alternating_roles(messages):
         else:
             merged.append(m)
     return merged
+
+
+TOKEN_PING_PATTERN = re.compile(r'<total_tokens>.*?</total_tokens>', re.DOTALL | re.IGNORECASE)
+
+
+def is_synthetic_token_ping(msg):
+    """Mesajin sadece sentetik <total_tokens> ping'i olup olmadigini kontrol eder."""
+    if not isinstance(msg, dict):
+        return False
+    content = msg.get("content")
+    if isinstance(content, str):
+        cleaned = TOKEN_PING_PATTERN.sub("", content).strip()
+        return len(cleaned) == 0 and ("total_tokens" in content)
+    elif isinstance(content, list):
+        if not content:
+            return True
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                cleaned = TOKEN_PING_PATTERN.sub("", b.get("text", "")).strip()
+                if cleaned:
+                    return False
+            else:
+                return False
+        return True
+    return False
+
+
+def strip_synthetic_token_pings(messages):
+    """
+    Sohbetteki sentetik <total_tokens> telemetry etiketlerini temizler.
+    Sadece bu etiketi iceren bos sistem mesajlarini tamamen eler boylece:
+    1. Mesaj sayimi dogal akisi yansitir (dongudeki sayilara dahil edilmez).
+    2. Ozetleyiciye (Gemini/Agent) gereksiz gurultu gitmez.
+    """
+    if not isinstance(messages, list):
+        return messages
+
+    cleaned_messages = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            cleaned_messages.append(msg)
+            continue
+
+        content = msg.get("content")
+
+        if isinstance(content, str):
+            if "total_tokens" in content:
+                new_content = TOKEN_PING_PATTERN.sub("", content).strip()
+                if not new_content:
+                    continue  # Sadece ping idi, tamamen atla
+                m_copy = dict(msg)
+                m_copy["content"] = new_content
+                cleaned_messages.append(m_copy)
+            else:
+                cleaned_messages.append(msg)
+
+        elif isinstance(content, list):
+            new_blocks = []
+            has_token_ping = False
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    txt = b.get("text", "")
+                    if "total_tokens" in txt:
+                        has_token_ping = True
+                        new_txt = TOKEN_PING_PATTERN.sub("", txt).strip()
+                        if new_txt:
+                            b_copy = dict(b)
+                            b_copy["text"] = new_txt
+                            new_blocks.append(b_copy)
+                    else:
+                        new_blocks.append(b)
+                else:
+                    new_blocks.append(b)
+
+            if has_token_ping:
+                if not new_blocks:
+                    continue  # Tum icerik ping idi, mesaji atla
+                m_copy = dict(msg)
+                m_copy["content"] = new_blocks
+                cleaned_messages.append(m_copy)
+            else:
+                cleaned_messages.append(msg)
+        else:
+            cleaned_messages.append(msg)
+
+    return cleaned_messages
 
 
 def extract_safe_user_boundary(messages, min_index=14, max_index=None):
@@ -278,8 +365,9 @@ def build_archive_chain(msgs, session_key, block_size, settings, cold=False):
 
     # 2. Yeni tamamlanmis blok var mi kontrol et (append-only: sadece SONA ekle)
     keep_recent_cfg = int(settings.get("keep_recent_messages", KEEP_RECENT))
+    cold_buffer_cfg = int(settings.get("cold_buffer", COLD_BUFFER))
     effective_keep = KEEP_RECENT_COLD if cold else keep_recent_cfg
-    cold_buffer = 0 if cold else COLD_BUFFER
+    cold_buffer = 0 if cold else cold_buffer_cfg
     safe_max_archive = len(msgs) - effective_keep - cold_buffer
 
     while (safe_max_archive - prev_boundary) >= block_size:
@@ -450,66 +538,163 @@ def deterministic_prune_slice(messages):
     return pruned, stats
 
 
-def anchor_prefix_cache_control(messages):
+def sanitize_system_prompt(payload):
     """
-    Dondurulan prefix diliminin son mesajina kalici {'type': 'ephemeral'}
-    capasi ekler. Dilim icindeki eski ara cache_control bloklarini temizler
-    boylece Anthropic'in 4 breakpoint butcesi korunur ve prefix 16 tur sabit kalir.
+    System prompt'unu dinamik degiskenlerden arindirarak onbellek dostu ve byte-identical hale getirir:
+    1. Claude Desktop/Code'un her turda degisen 'x-anthropic-billing-header: cch=...; cc_turn_index=...'
+       bloklarini temizler. Bu baslik her istekte degistigi icin KV onbellegini tam 17.024 tokende (tools bitimi) kilitliyordu!
+    2. <total_tokens>...</total_tokens> gibi sentetik sayac kaliplarini temizler.
+    3. System icerisindeki tekil veya coklu bloklari standardize eder.
     """
-    if not messages:
-        return messages
+    sys_val = payload.get("system")
+    if not sys_val:
+        return payload
 
-    anchored = []
-    for m in messages:
-        mc = copy.deepcopy(m)
-        content = mc.get("content")
-        if isinstance(content, list):
-            for b in content:
-                if isinstance(b, dict) and "cache_control" in b:
-                    del b["cache_control"]
-        elif isinstance(mc, dict) and "cache_control" in mc:
-            del mc["cache_control"]
-        anchored.append(mc)
+    if isinstance(sys_val, list):
+        clean_blocks = []
+        for block in sys_val:
+            if isinstance(block, dict):
+                text = block.get("text", "")
+                if "x-anthropic-billing-header:" in text:
+                    continue
+                if "<total_tokens>" in text:
+                    text = re.sub(r"<total_tokens>.*?</total_tokens>", "", text).strip()
+                    block = dict(block)
+                    block["text"] = text
+                clean_blocks.append(block)
+            elif isinstance(block, str):
+                if "x-anthropic-billing-header:" in block:
+                    continue
+                if "<total_tokens>" in block:
+                    block = re.sub(r"<total_tokens>.*?</total_tokens>", "", block).strip()
+                clean_blocks.append(block)
+        payload["system"] = clean_blocks
+    elif isinstance(sys_val, str):
+        if "x-anthropic-billing-header:" in sys_val:
+            sys_val = re.sub(r"x-anthropic-billing-header:[^\n]+\n?", "", sys_val)
+        if "<total_tokens>" in sys_val:
+            sys_val = re.sub(r"<total_tokens>.*?</total_tokens>", "", sys_val)
+        payload["system"] = sys_val.strip()
 
-    last_m = anchored[-1]
-    content = last_m.get("content")
+    return payload
+
+
+def remove_cache_control_from_msg(msg):
+    """Mesaj icindeki tum cache_control etiketlerini temizler."""
+    if not isinstance(msg, dict):
+        return
+    content = msg.get("content")
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and "cache_control" in b:
+                del b["cache_control"]
+    elif "cache_control" in msg:
+        del msg["cache_control"]
+
+
+def add_cache_control_to_msg(msg):
+    """Mesajin yalnizca son icerik bloguna standart ephemeral cache_control ekler."""
+    if not isinstance(msg, dict):
+        return
+    remove_cache_control_from_msg(msg)
+    content = msg.get("content")
     if isinstance(content, str):
-        last_m["content"] = [
+        msg["content"] = [
             {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
         ]
-    elif isinstance(content, list) and content:
+    elif isinstance(content, list) and len(content) > 0:
         last_b = content[-1]
         if isinstance(last_b, dict):
             last_b["cache_control"] = {"type": "ephemeral"}
         else:
             content.append({"type": "text", "text": "", "cache_control": {"type": "ephemeral"}})
     elif not content:
-        last_m["content"] = [
+        msg["content"] = [
             {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}}
         ]
 
+
+def anchor_prefix_cache_control(messages):
+    """
+    Dondurulan prefix diliminin son mesajina kalici {'type': 'ephemeral'}
+    capasi ekler. Dilim icindeki diger ara cache_control bloklarini temizler.
+    """
+    if not messages:
+        return messages
+
+    anchored = copy.deepcopy(messages)
+    for m in anchored:
+        remove_cache_control_from_msg(m)
+
+    add_cache_control_to_msg(anchored[-1])
     return anchored
+
+
+def apply_sliding_cache_markers(payload, archive_last_idx=None):
+    """
+    Mesajlar uzerindeki cache_control noktalarini akilli ve kayan (sliding) olarak ayarlar:
+    1. Eger arsiv varsa (archive_last_idx), o mesaja kalici onbellek capasi koyar.
+    2. Onceki tamamlanmis kullanici turune (prev_user_idx) onbellek noktasi koyar
+       (bu nokta onceki istekte yazilmisti; mevcut istekte buradan %95+ OKUMA yapilir).
+    3. Guncel kullanici turune (messages[-1]) onbellek noktasi koyar
+       (bu, bir sonraki turda okunmak uzere onbellege YAZMA noktasidir).
+    4. Aradaki tum eski kayan noktalari temizler.
+    """
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return payload
+
+    for idx, m in enumerate(msgs):
+        if archive_last_idx is not None and idx == archive_last_idx:
+            continue
+        remove_cache_control_from_msg(m)
+
+    last_idx = len(msgs) - 1
+    add_cache_control_to_msg(msgs[last_idx])
+
+    prev_user_idx = None
+    for i in range(last_idx - 1, -1, -1):
+        if msgs[i].get("role") == "user":
+            prev_user_idx = i
+            break
+
+    if prev_user_idx is not None and prev_user_idx != archive_last_idx and prev_user_idx > 0:
+        add_cache_control_to_msg(msgs[prev_user_idx])
+
+    if archive_last_idx is not None and 0 <= archive_last_idx < len(msgs):
+        add_cache_control_to_msg(msgs[archive_last_idx])
+
+    return payload
 
 
 def sanitize_cache_control_budget(payload, max_allowed=4):
     """
     Payload icerisindeki toplam cache_control blok sayisini 4 ile sinirlar.
-    Sistem (2) + Sabit Prefix Capasi (1) + En Son Kullanici Mesaji (1) = 4.
-    Aradaki gereksiz tum ara breakpoint'leri eler.
+    Sistem (en fazla 1) + Tools (en fazla 1) + Arsiv (1) + Onceki Tur (1) + Guncel Tur (1).
+    Toplam 4 sinirini asarsa en az kritik olandan baslayarak siler.
     """
-    system = payload.get("system", [])
-    tools = payload.get("tools", [])
-    msgs = payload.get("messages", [])
+    sys = payload.get("system")
+    if isinstance(sys, list):
+        sys_with_cc = [s for s in sys if isinstance(s, dict) and "cache_control" in s]
+        if len(sys_with_cc) > 1:
+            for s in sys_with_cc[:-1]:
+                del s["cache_control"]
 
     markers = []
-    if isinstance(system, list):
-        for s in system:
+    if isinstance(sys, list):
+        for s_idx, s in enumerate(sys):
             if isinstance(s, dict) and "cache_control" in s:
-                markers.append(("system", s))
-    for t in tools:
-        if isinstance(t, dict) and "cache_control" in t:
-            markers.append(("tool", t))
+                markers.append(("system", s_idx, s))
+    elif isinstance(sys, dict) and "cache_control" in sys:
+        markers.append(("system_dict", 0, sys))
 
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        for t_idx, t in enumerate(tools):
+            if isinstance(t, dict) and "cache_control" in t:
+                markers.append(("tool", t_idx, t))
+
+    msgs = payload.get("messages") or []
     for m_idx, m in enumerate(msgs):
         content = m.get("content")
         if isinstance(content, list):
@@ -519,32 +704,21 @@ def sanitize_cache_control_budget(payload, max_allowed=4):
         elif isinstance(m, dict) and "cache_control" in m:
             markers.append(("msg_dict", m_idx, m))
 
-    sys_markers = [item for item in markers if item[0] == "system"]
-    if len(sys_markers) > 1:
-        for item in sys_markers[:-1]:
-            if "cache_control" in item[1]:
-                del item[1]["cache_control"]
-
     if len(markers) <= max_allowed:
         return payload
 
     excess = len(markers) - max_allowed
     msg_markers = [item for item in markers if item[0] in ("msg", "msg_dict")]
 
-    # Mesajlarda birden fazla marker varsa:
-    # Ilk mesaji (prefix capasi) ve son mesaji (guncel tur) koru, aradakileri sil
-    if len(msg_markers) > 2:
-        for item in msg_markers[1:-1]:
-            if excess <= 0:
-                break
-            target = item[2] if item[0] == "msg" else item[1]
-            if isinstance(target, dict) and "cache_control" in target:
-                del target["cache_control"]
-                excess -= 1
+    # Mesajlarda 2'den fazla marker varsa aradakileri/eski olanlari temizle
+    if len(msg_markers) > 2 and excess > 0:
+        target = msg_markers[0][2] if msg_markers[0][0] == "msg" else msg_markers[0][1]
+        if isinstance(target, dict) and "cache_control" in target:
+            del target["cache_control"]
+            excess -= 1
 
-    # Eger hala bütçe aşıldıysa sondan başa doğru (en sonuncu haric) temizle
     if excess > 0 and len(msg_markers) > 1:
-        for item in reversed(msg_markers[:-1]):
+        for item in msg_markers[:-1]:
             if excess <= 0:
                 break
             target = item[2] if item[0] == "msg" else item[1]
@@ -596,15 +770,20 @@ def plan(payload, session_id=None):
     if not isinstance(msgs, list):
         return {"applied": False, "reason": "mesaj yok"}
 
+    # Sentetik <total_tokens> pinglemesini temizle ve rolleri guvenle birlestir
+    msgs = strip_synthetic_token_pings(msgs)
+    msgs = ensure_alternating_roles(msgs)
+
     settings = db.get_all_settings()
     block_size = int(settings.get("block_size", BLOCK))
     keep_recent_cfg = int(settings.get("keep_recent_messages", KEEP_RECENT))
-    cold_buffer = COLD_BUFFER
+    cold_buffer = int(settings.get("cold_buffer", COLD_BUFFER))
 
     n = len(msgs)
     key = session_key(payload, session_id)
     st, since = touch_session(key)
-    cold = since is None or since >= TTL
+    ttl_cfg = int(settings.get("ttl_seconds", TTL))
+    cold = since is None or since >= ttl_cfg
 
     # 1. Immutable Append-Only Ledger Zinciri
     archive_result, archive_cut, methods_used = build_archive_chain(
@@ -638,13 +817,16 @@ def plan(payload, session_id=None):
 
     # 4. Arsiv sonuna cache capasi ekle
     archive_result_anchored = anchor_prefix_cache_control(archive_result)
+    archive_anchor_idx = len(archive_result_anchored) - 1
 
     # 5. Final payload olustur
     final_messages = ensure_alternating_roles(archive_result_anchored + cold_pruned + hot_msgs)
     new_payload = dict(payload)
     new_payload["messages"] = final_messages
+    new_payload = sanitize_system_prompt(new_payload)
+    new_payload = apply_sliding_cache_markers(new_payload, archive_last_idx=archive_anchor_idx)
     normalize_cache_controls(new_payload)
-    new_payload = sanitize_cache_control_budget(new_payload)
+    new_payload = sanitize_cache_control_budget(new_payload, max_allowed=4)
     body = json.dumps(new_payload, ensure_ascii=False).encode("utf-8")
 
     # Tasarruf hesabi
